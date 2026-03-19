@@ -101,6 +101,61 @@ function salvarTransacao(
     ]);
 }
 
+/**
+ * Formatos aceitos:
+ * receita 500 salario 2026-03-19
+ * despesa 120 mercado 2026-03-19
+ * despesas 120 mercado extra 2026-03-19
+ * receitas 250 freelance 2026-03-19
+ */
+function interpretarTransacao(string $message): ?array
+{
+    $partes = preg_split('/\s+/', trim($message));
+
+    if (!$partes || count($partes) < 4) {
+        return null;
+    }
+
+    $tipoBruto = strtolower(trim((string)$partes[0]));
+    $valorBruto = str_replace(',', '.', trim((string)$partes[1]));
+    $data = trim((string)$partes[count($partes) - 1]);
+
+    $mapaTipos = [
+        'receita' => 'receita',
+        'receitas' => 'receita',
+        'despesa' => 'despesa',
+        'despesas' => 'despesa',
+    ];
+
+    if (!isset($mapaTipos[$tipoBruto])) {
+        return null;
+    }
+
+    $tipo = $mapaTipos[$tipoBruto];
+
+    if (!is_numeric($valorBruto) || (float)$valorBruto <= 0) {
+        return null;
+    }
+
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $data)) {
+        return null;
+    }
+
+    $categoriaPartes = array_slice($partes, 2, -1);
+    $categoria = trim(implode(' ', $categoriaPartes));
+
+    if ($categoria === '') {
+        return null;
+    }
+
+    return [
+        'tipo' => $tipo,
+        'valor' => (float)$valorBruto,
+        'categoria' => strtolower($categoria),
+        'data' => $data
+    ];
+}
+
 try {
     $inputRaw = file_get_contents('php://input');
 
@@ -114,9 +169,9 @@ try {
         responderOk();
     }
 
-    $message = trim((string) ($update['message']['text'] ?? ''));
+    $message = trim((string)($update['message']['text'] ?? ''));
     $chatId = $update['message']['chat']['id'] ?? null;
-    $nomeTelegram = trim((string) ($update['message']['chat']['first_name'] ?? 'Usuário'));
+    $nomeTelegram = trim((string)($update['message']['chat']['first_name'] ?? 'Usuário'));
 
     if (!$chatId) {
         responderOk();
@@ -125,7 +180,7 @@ try {
     if ($message === '/start') {
         enviarMensagem(
             $chatId,
-            "Olá, {$nomeTelegram}.\n\nPara vincular sua conta, envie:\n/vincular SEU_CODIGO\n\nDepois você poderá usar:\n/saldo\n\nE registrar transações assim:\nreceita 500 salario 2026-03-19\ndespesa 120 mercado 2026-03-19",
+            "Olá, {$nomeTelegram}.\n\nPara vincular sua conta, envie:\n/vincular SEU_CODIGO\n\nDepois use:\n/saldo\n\nExemplos de transação:\nreceita 500 salario 2026-03-19\ndespesa 120 mercado 2026-03-19",
             $TOKEN
         );
         responderOk();
@@ -133,7 +188,7 @@ try {
 
     if (str_starts_with($message, '/vincular')) {
         $partes = preg_split('/\s+/', $message);
-        $codigo = trim((string) ($partes[1] ?? ''));
+        $codigo = trim((string)($partes[1] ?? ''));
 
         if ($codigo === '') {
             enviarMensagem($chatId, "Use assim:\n/vincular SEU_CODIGO", $TOKEN);
@@ -187,7 +242,7 @@ try {
         responderOk();
     }
 
-    $usuarioId = (int) $usuario['id'];
+    $usuarioId = (int)$usuario['id'];
 
     if ($message === '/saldo') {
         $saldo = buscarSaldo($conn, $usuarioId);
@@ -201,36 +256,36 @@ try {
         responderOk();
     }
 
-    $partes = preg_split('/\s+/', $message);
+    $transacao = interpretarTransacao($message);
 
-    if (count($partes) >= 4) {
-        $tipo = strtolower(trim((string) $partes[0]));
-        $valorRaw = str_replace(',', '.', trim((string) $partes[1]));
-        $categoria = strtolower(trim((string) $partes[2]));
-        $data = trim((string) $partes[3]);
+    if ($transacao !== null) {
+        salvarTransacao(
+            $conn,
+            $usuarioId,
+            $transacao['tipo'],
+            $transacao['valor'],
+            $transacao['categoria'],
+            $transacao['data']
+        );
 
-        $tipoValido = in_array($tipo, ['receita', 'despesa'], true);
-        $valorValido = is_numeric($valorRaw) && (float) $valorRaw > 0;
-        $dataValida = (bool) preg_match('/^\d{4}-\d{2}-\d{2}$/', $data);
+        $saldo = buscarSaldo($conn, $usuarioId);
 
-        if ($tipoValido && $valorValido && $dataValida) {
-            salvarTransacao($conn, $usuarioId, $tipo, (float) $valorRaw, $categoria, $data);
+        enviarMensagem(
+            $chatId,
+            "✅ " . ucfirst($transacao['tipo']) . " registrada.\n"
+            . "Categoria: {$transacao['categoria']}\n"
+            . "Valor: " . formatarReal($transacao['valor']) . "\n"
+            . "Data: {$transacao['data']}\n\n"
+            . "Saldo atual: " . formatarReal($saldo['saldo']),
+            $TOKEN
+        );
 
-            $saldo = buscarSaldo($conn, $usuarioId);
-
-            enviarMensagem(
-                $chatId,
-                "✅ Transação registrada.\n\nSaldo atual: " . formatarReal($saldo['saldo']),
-                $TOKEN
-            );
-
-            responderOk();
-        }
+        responderOk();
     }
 
     enviarMensagem(
         $chatId,
-        "Comando não reconhecido.\n\nUse:\n/vincular SEU_CODIGO\n/saldo\n\nOu registre transações assim:\nreceita 500 salario 2026-03-19\ndespesa 120 mercado 2026-03-19",
+        "Comando não reconhecido.\n\nUse:\n/vincular SEU_CODIGO\n/saldo\n\nExemplos:\nreceita 500 salario 2026-03-19\ndespesa 120 mercado 2026-03-19",
         $TOKEN
     );
 
