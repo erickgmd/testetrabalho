@@ -1,7 +1,7 @@
 <?php
 declare(strict_types=1);
 
-$TOKEN = "SEU_TOKEN_AQUI";
+$TOKEN = "8308783962:AAFpg2xrjevfet-q-6jt2kHNc7n_IFMstt8";
 
 $input = json_decode(file_get_contents("php://input"), true);
 
