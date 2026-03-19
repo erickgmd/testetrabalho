@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 require __DIR__ . '/db.php';
 
-$TOKEN = "SEU_TOKEN_DO_BOT";
+$TOKEN = "";
 
 $input = json_decode(file_get_contents("php://input"), true);
 

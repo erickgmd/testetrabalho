@@ -5,7 +5,7 @@ $host = "aws-1-us-east-1.pooler.supabase.com";
 $port = "6543";
 $dbname = "postgres";
 $user = "postgres.ifymzeiuxusebhymxokx";
-$pass = "SUA_SENHA_AQUI";
+$pass = "Cashapp@1123";
 
 try {
     $dsn = "pgsql:host={$host};port={$port};dbname={$dbname};sslmode=require";
