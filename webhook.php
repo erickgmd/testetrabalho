@@ -3,33 +3,21 @@ declare(strict_types=1);
 
 require __DIR__ . '/db.php';
 
-$TOKEN = "8308783962:AAFpg2xrjevfet-q-6jt2kHNc7n_IFMstt8";
+$TOKEN = 'SEU_TOKEN_DO_BOT';
 
-$input = json_decode(file_get_contents("php://input"), true);
-
-if (!$input || !isset($input["message"])) {
-    http_response_code(200);
-    exit;
-}
-
-$message = trim($input["message"]["text"] ?? '');
-$chat_id = $input["message"]["chat"]["id"] ?? null;
-$nome = $input["message"]["chat"]["first_name"] ?? 'Usuário';
-
-if (!$chat_id || $message === '') {
-    http_response_code(200);
-    exit;
-}
-
-/**
- * Envia mensagem para o Telegram
- */
-function enviarMensagem(int|string $chat_id, string $texto, string $TOKEN): void
+function responderOk(): void
 {
-    $url = "https://api.telegram.org/bot{$TOKEN}/sendMessage";
+    http_response_code(200);
+    echo 'OK';
+    exit;
+}
+
+function enviarMensagem(int|string $chatId, string $texto, string $token): void
+{
+    $url = "https://api.telegram.org/bot{$token}/sendMessage";
 
     $payload = [
-        'chat_id' => $chat_id,
+        'chat_id' => $chatId,
         'text' => $texto
     ];
 
@@ -41,56 +29,27 @@ function enviarMensagem(int|string $chat_id, string $texto, string $TOKEN): void
     curl_exec($ch);
 }
 
-/**
- * Busca ou cria usuário pelo telegram_id
- */
-function buscarOuCriarUsuario(PDO $conn, int|string $chat_id, string $nome): array
+function formatarReal(float $valor): string
 {
-    $stmt = $conn->prepare("SELECT * FROM usuarios WHERE telegram_id = :telegram_id LIMIT 1");
-    $stmt->execute([':telegram_id' => $chat_id]);
-    $usuario = $stmt->fetch();
-
-    if ($usuario) {
-        return $usuario;
-    }
-
-    $insert = $conn->prepare("
-        INSERT INTO usuarios (telegram_id, nome)
-        VALUES (:telegram_id, :nome)
-    ");
-    $insert->execute([
-        ':telegram_id' => $chat_id,
-        ':nome' => $nome
-    ]);
-
-    $stmt = $conn->prepare("SELECT * FROM usuarios WHERE telegram_id = :telegram_id LIMIT 1");
-    $stmt->execute([':telegram_id' => $chat_id]);
-    return $stmt->fetch();
+    return 'R$ ' . number_format($valor, 2, ',', '.');
 }
 
-/**
- * Salva transação
- */
-function salvarTransacao(PDO $conn, int $usuario_id, string $tipo, float $valor, string $categoria, string $data): void
+function buscarUsuarioVinculado(PDO $conn, int|string $telegramId): ?array
 {
     $stmt = $conn->prepare("
-        INSERT INTO transacoes (usuario_id, tipo, valor, categoria, data)
-        VALUES (:usuario_id, :tipo, :valor, :categoria, :data)
+        SELECT u.*
+        FROM telegram_vinculos tv
+        INNER JOIN usuarios u ON u.id = tv.usuario_id
+        WHERE tv.telegram_id = :telegram_id
+        LIMIT 1
     ");
+    $stmt->execute([':telegram_id' => $telegramId]);
+    $usuario = $stmt->fetch(PDO::FETCH_ASSOC);
 
-    $stmt->execute([
-        ':usuario_id' => $usuario_id,
-        ':tipo' => $tipo,
-        ':valor' => $valor,
-        ':categoria' => $categoria,
-        ':data' => $data
-    ]);
+    return $usuario ?: null;
 }
 
-/**
- * Busca saldo
- */
-function buscarSaldo(PDO $conn, int $usuario_id): array
+function buscarSaldo(PDO $conn, int $usuarioId): array
 {
     $stmt = $conn->prepare("
         SELECT
@@ -99,103 +58,177 @@ function buscarSaldo(PDO $conn, int $usuario_id): array
         FROM transacoes
         WHERE usuario_id = :usuario_id
     ");
+    $stmt->execute([':usuario_id' => $usuarioId]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
-    $stmt->execute([':usuario_id' => $usuario_id]);
-    $row = $stmt->fetch();
-
-    $receitas = (float)($row['receitas'] ?? 0);
-    $despesas = (float)($row['despesas'] ?? 0);
-    $saldo = $receitas - $despesas;
+    $receitas = (float) ($row['receitas'] ?? 0);
+    $despesas = (float) ($row['despesas'] ?? 0);
 
     return [
         'receitas' => $receitas,
         'despesas' => $despesas,
-        'saldo' => $saldo
+        'saldo' => $receitas - $despesas
     ];
 }
 
-/**
- * Formata valor em real
- */
-function formatarReal(float $valor): string
-{
-    return 'R$ ' . number_format($valor, 2, ',', '.');
+function salvarTransacao(
+    PDO $conn,
+    int $usuarioId,
+    string $tipo,
+    float $valor,
+    string $categoria,
+    string $data
+): void {
+    $stmt = $conn->prepare("
+        INSERT INTO transacoes (usuario_id, tipo, valor, categoria, data)
+        VALUES (:usuario_id, :tipo, :valor, :categoria, :data)
+    ");
+
+    $stmt->execute([
+        ':usuario_id' => $usuarioId,
+        ':tipo' => $tipo,
+        ':valor' => $valor,
+        ':categoria' => $categoria,
+        ':data' => $data
+    ]);
 }
 
-$usuario = buscarOuCriarUsuario($conn, $chat_id, $nome);
-$usuario_id = (int)$usuario['id'];
+$inputRaw = file_get_contents('php://input');
+if (!$inputRaw) {
+    responderOk();
+}
 
-/*
-|--------------------------------------------------------------------------
-| COMANDOS
-|--------------------------------------------------------------------------
-*/
-if ($message === "/start") {
+$update = json_decode($inputRaw, true);
+if (!$update || !isset($update['message'])) {
+    responderOk();
+}
+
+$message = trim($update['message']['text'] ?? '');
+$chatId = $update['message']['chat']['id'] ?? null;
+$nomeTelegram = $update['message']['chat']['first_name'] ?? 'Usuário';
+
+if (!$chatId) {
+    responderOk();
+}
+
+if ($message === '/start') {
+    $texto = "Olá, {$nomeTelegram}.\n\n"
+        . "Para começar, vincule sua conta do site com:\n"
+        . "/vincular SEU_CODIGO\n\n"
+        . "Depois você poderá usar:\n"
+        . "/saldo\n"
+        . "receita 500 salario 2026-03-19\n"
+        . "despesa 120 mercado 2026-03-19";
+
+    enviarMensagem($chatId, $texto, $TOKEN);
+    responderOk();
+}
+
+if (str_starts_with($message, '/vincular')) {
+    $partes = preg_split('/\s+/', $message);
+    $codigo = trim($partes[1] ?? '');
+
+    if ($codigo === '') {
+        enviarMensagem($chatId, "Use assim:\n/vincular SEU_CODIGO", $TOKEN);
+        responderOk();
+    }
+
+    $stmt = $conn->prepare("
+        SELECT *
+        FROM telegram_vinculos
+        WHERE codigo_vinculo = :codigo
+        LIMIT 1
+    ");
+    $stmt->execute([':codigo' => $codigo]);
+    $vinculo = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$vinculo) {
+        enviarMensagem($chatId, "Código inválido.", $TOKEN);
+        responderOk();
+    }
+
+    if (!empty($vinculo['telegram_id'])) {
+        enviarMensagem($chatId, "Esse código já foi utilizado.", $TOKEN);
+        responderOk();
+    }
+
+    $updateStmt = $conn->prepare("
+        UPDATE telegram_vinculos
+        SET telegram_id = :telegram_id,
+            nome_telegram = :nome_telegram
+        WHERE id = :id
+    ");
+
+    $updateStmt->execute([
+        ':telegram_id' => $chatId,
+        ':nome_telegram' => $nomeTelegram,
+        ':id' => $vinculo['id']
+    ]);
+
+    enviarMensagem($chatId, "Conta vinculada com sucesso ao Cash Flow.", $TOKEN);
+    responderOk();
+}
+
+$usuario = buscarUsuarioVinculado($conn, $chatId);
+
+if (!$usuario) {
     enviarMensagem(
-        $chat_id,
-        "Olá, {$nome}.\n\nUse os comandos:\n/saldo\n\nOu envie assim:\nreceita 500 salario 2026-03-19\ndespesa 120 mercado 2026-03-19",
+        $chatId,
+        "Sua conta ainda não está vinculada.\n\nAcesse o site, gere seu código e envie:\n/vincular SEU_CODIGO",
         $TOKEN
     );
-    http_response_code(200);
-    exit;
+    responderOk();
 }
 
-if ($message === "/saldo") {
-    $dados = buscarSaldo($conn, $usuario_id);
+$usuarioId = (int) $usuario['id'];
 
-    enviarMensagem(
-        $chat_id,
-        "💰 Saldo atual\n\nReceitas: " . formatarReal($dados['receitas']) .
-        "\nDespesas: " . formatarReal($dados['despesas']) .
-        "\nSaldo: " . formatarReal($dados['saldo']),
-        $TOKEN
-    );
+if ($message === '/saldo') {
+    $saldo = buscarSaldo($conn, $usuarioId);
 
-    http_response_code(200);
-    exit;
+    $texto = "💰 Saldo atual\n\n"
+        . "Receitas: " . formatarReal($saldo['receitas']) . "\n"
+        . "Despesas: " . formatarReal($saldo['despesas']) . "\n"
+        . "Saldo: " . formatarReal($saldo['saldo']);
+
+    enviarMensagem($chatId, $texto, $TOKEN);
+    responderOk();
 }
 
-/*
-|--------------------------------------------------------------------------
-| FORMATO DE MENSAGEM:
-| receita 500 salario 2026-03-19
-| despesa 120 mercado 2026-03-19
-|--------------------------------------------------------------------------
-*/
 $partes = preg_split('/\s+/', $message);
 
 if (count($partes) >= 4) {
-    $tipo = strtolower($partes[0]);
-    $valor = str_replace(',', '.', $partes[1]);
-    $categoria = strtolower($partes[2]);
-    $data = $partes[3];
+    $tipo = strtolower(trim($partes[0]));
+    $valorRaw = str_replace(',', '.', trim($partes[1]));
+    $categoria = strtolower(trim($partes[2]));
+    $data = trim($partes[3]);
 
-    if (
-        in_array($tipo, ['receita', 'despesa'], true) &&
-        is_numeric($valor) &&
-        preg_match('/^\d{4}-\d{2}-\d{2}$/', $data)
-    ) {
-        salvarTransacao($conn, $usuario_id, $tipo, (float)$valor, $categoria, $data);
+    $tipoValido = in_array($tipo, ['receita', 'despesa'], true);
+    $valorValido = is_numeric($valorRaw) && (float)$valorRaw > 0;
+    $dataValida = (bool) preg_match('/^\d{4}-\d{2}-\d{2}$/', $data);
 
-        $dados = buscarSaldo($conn, $usuario_id);
+    if ($tipoValido && $valorValido && $dataValida) {
+        salvarTransacao($conn, $usuarioId, $tipo, (float)$valorRaw, $categoria, $data);
+
+        $saldo = buscarSaldo($conn, $usuarioId);
 
         enviarMensagem(
-            $chat_id,
-            "✅ Transação registrada com sucesso.\n\nSaldo atual: " . formatarReal($dados['saldo']),
+            $chatId,
+            "✅ Transação registrada com sucesso.\n\nSaldo atual: " . formatarReal($saldo['saldo']),
             $TOKEN
         );
 
-        http_response_code(200);
-        exit;
+        responderOk();
     }
 }
 
 enviarMensagem(
-    $chat_id,
-    "Não entendi sua mensagem.\n\nExemplos:\nreceita 500 salario 2026-03-19\ndespesa 120 mercado 2026-03-19\n/saldo",
+    $chatId,
+    "Não entendi sua mensagem.\n\nUse:\n"
+    . "/saldo\n"
+    . "/vincular SEU_CODIGO\n"
+    . "receita 500 salario 2026-03-19\n"
+    . "despesa 120 mercado 2026-03-19",
     $TOKEN
 );
 
-http_response_code(200);
-exit;
-?>
+responderOk();
