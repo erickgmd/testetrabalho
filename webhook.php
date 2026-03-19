@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 require __DIR__ . '/db.php';
 
-$TOKEN = '8308783962:AAFpg2xrjevfet-q-6jt2kHNc7n_IFMstt8';
+$TOKEN = 'COLOQUE_SEU_NOVO_TOKEN_AQUI';
 
 function responderOk(): void
 {
@@ -26,7 +26,15 @@ function enviarMensagem(int|string $chatId, string $texto, string $token): void
     curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_TIMEOUT, 15);
-    curl_exec($ch);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+
+    $response = curl_exec($ch);
+
+    if ($response === false) {
+        error_log('Erro cURL Telegram: ' . curl_error($ch));
+    }
+
+    curl_close($ch);
 }
 
 function formatarReal(float $valor): string
@@ -93,134 +101,142 @@ function salvarTransacao(
     ]);
 }
 
-$inputRaw = file_get_contents('php://input');
-if (!$inputRaw) {
-    responderOk();
-}
+try {
+    $inputRaw = file_get_contents('php://input');
 
-$update = json_decode($inputRaw, true);
-if (!$update || !isset($update['message'])) {
-    responderOk();
-}
-
-$message = trim($update['message']['text'] ?? '');
-$chatId = $update['message']['chat']['id'] ?? null;
-$nomeTelegram = $update['message']['chat']['first_name'] ?? 'Usuário';
-
-if (!$chatId) {
-    responderOk();
-}
-
-if ($message === '/start') {
-    enviarMensagem(
-        $chatId,
-        "Olá, {$nomeTelegram}.\n\nPara vincular sua conta, envie:\n/vincular SEU_CODIGO\n\nDepois você poderá usar:\n/saldo",
-        $TOKEN
-    );
-    responderOk();
-}
-
-if (str_starts_with($message, '/vincular')) {
-    $partes = preg_split('/\s+/', $message);
-    $codigo = trim($partes[1] ?? '');
-
-    if ($codigo === '') {
-        enviarMensagem($chatId, "Use assim:\n/vincular SEU_CODIGO", $TOKEN);
+    if (!$inputRaw) {
         responderOk();
     }
 
-    $stmt = $conn->prepare("
-        SELECT *
-        FROM telegram_vinculos
-        WHERE codigo_vinculo = :codigo
-        LIMIT 1
-    ");
-    $stmt->execute([':codigo' => $codigo]);
-    $vinculo = $stmt->fetch(PDO::FETCH_ASSOC);
+    $update = json_decode($inputRaw, true);
 
-    if (!$vinculo) {
-        enviarMensagem($chatId, "Código inválido.", $TOKEN);
+    if (!$update || !isset($update['message'])) {
         responderOk();
     }
 
-    if (!empty($vinculo['telegram_id'])) {
-        enviarMensagem($chatId, "Esse código já foi utilizado.", $TOKEN);
+    $message = trim((string) ($update['message']['text'] ?? ''));
+    $chatId = $update['message']['chat']['id'] ?? null;
+    $nomeTelegram = trim((string) ($update['message']['chat']['first_name'] ?? 'Usuário'));
+
+    if (!$chatId) {
         responderOk();
     }
 
-    $updateStmt = $conn->prepare("
-        UPDATE telegram_vinculos
-        SET telegram_id = :telegram_id,
-            nome_telegram = :nome_telegram
-        WHERE id = :id
-    ");
-
-    $updateStmt->execute([
-        ':telegram_id' => $chatId,
-        ':nome_telegram' => $nomeTelegram,
-        ':id' => $vinculo['id']
-    ]);
-
-    enviarMensagem($chatId, "Conta vinculada com sucesso.", $TOKEN);
-    responderOk();
-}
-
-$usuario = buscarUsuarioVinculado($conn, $chatId);
-
-if (!$usuario) {
-    enviarMensagem(
-        $chatId,
-        "Sua conta ainda não está vinculada.\n\nEnvie:\n/vincular SEU_CODIGO",
-        $TOKEN
-    );
-    responderOk();
-}
-
-$usuarioId = (int) $usuario['id'];
-
-if ($message === '/saldo') {
-    $saldo = buscarSaldo($conn, $usuarioId);
-
-    $texto = "💰 Saldo atual\n\n"
-        . "Receitas: " . formatarReal($saldo['receitas']) . "\n"
-        . "Despesas: " . formatarReal($saldo['despesas']) . "\n"
-        . "Saldo: " . formatarReal($saldo['saldo']);
-
-    enviarMensagem($chatId, $texto, $TOKEN);
-    responderOk();
-}
-
-$partes = preg_split('/\s+/', $message);
-
-if (count($partes) >= 4) {
-    $tipo = strtolower(trim($partes[0]));
-    $valorRaw = str_replace(',', '.', trim($partes[1]));
-    $categoria = strtolower(trim($partes[2]));
-    $data = trim($partes[3]);
-
-    $tipoValido = in_array($tipo, ['receita', 'despesa'], true);
-    $valorValido = is_numeric($valorRaw) && (float)$valorRaw > 0;
-    $dataValida = (bool) preg_match('/^\d{4}-\d{2}-\d{2}$/', $data);
-
-    if ($tipoValido && $valorValido && $dataValida) {
-        salvarTransacao($conn, $usuarioId, $tipo, (float)$valorRaw, $categoria, $data);
-
-        $saldo = buscarSaldo($conn, $usuarioId);
-
+    if ($message === '/start') {
         enviarMensagem(
             $chatId,
-            "✅ Transação registrada.\n\nSaldo atual: " . formatarReal($saldo['saldo']),
+            "Olá, {$nomeTelegram}.\n\nPara vincular sua conta, envie:\n/vincular SEU_CODIGO\n\nDepois você poderá usar:\n/saldo\n\nE registrar transações assim:\nreceita 500 salario 2026-03-19\ndespesa 120 mercado 2026-03-19",
             $TOKEN
         );
-
         responderOk();
     }
+
+    if (str_starts_with($message, '/vincular')) {
+        $partes = preg_split('/\s+/', $message);
+        $codigo = trim((string) ($partes[1] ?? ''));
+
+        if ($codigo === '') {
+            enviarMensagem($chatId, "Use assim:\n/vincular SEU_CODIGO", $TOKEN);
+            responderOk();
+        }
+
+        $stmt = $conn->prepare("
+            SELECT *
+            FROM telegram_vinculos
+            WHERE codigo_vinculo = :codigo
+            LIMIT 1
+        ");
+        $stmt->execute([':codigo' => $codigo]);
+        $vinculo = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$vinculo) {
+            enviarMensagem($chatId, "Código inválido.", $TOKEN);
+            responderOk();
+        }
+
+        if (!empty($vinculo['telegram_id'])) {
+            enviarMensagem($chatId, "Esse código já foi utilizado.", $TOKEN);
+            responderOk();
+        }
+
+        $updateStmt = $conn->prepare("
+            UPDATE telegram_vinculos
+            SET telegram_id = :telegram_id,
+                nome_telegram = :nome_telegram
+            WHERE id = :id
+        ");
+
+        $updateStmt->execute([
+            ':telegram_id' => $chatId,
+            ':nome_telegram' => $nomeTelegram,
+            ':id' => $vinculo['id']
+        ]);
+
+        enviarMensagem($chatId, "Conta vinculada com sucesso.", $TOKEN);
+        responderOk();
+    }
+
+    $usuario = buscarUsuarioVinculado($conn, $chatId);
+
+    if (!$usuario) {
+        enviarMensagem(
+            $chatId,
+            "Sua conta ainda não está vinculada.\n\nEnvie:\n/vincular SEU_CODIGO",
+            $TOKEN
+        );
+        responderOk();
+    }
+
+    $usuarioId = (int) $usuario['id'];
+
+    if ($message === '/saldo') {
+        $saldo = buscarSaldo($conn, $usuarioId);
+
+        $texto = "💰 Saldo atual\n\n"
+            . "Receitas: " . formatarReal($saldo['receitas']) . "\n"
+            . "Despesas: " . formatarReal($saldo['despesas']) . "\n"
+            . "Saldo: " . formatarReal($saldo['saldo']);
+
+        enviarMensagem($chatId, $texto, $TOKEN);
+        responderOk();
+    }
+
+    $partes = preg_split('/\s+/', $message);
+
+    if (count($partes) >= 4) {
+        $tipo = strtolower(trim((string) $partes[0]));
+        $valorRaw = str_replace(',', '.', trim((string) $partes[1]));
+        $categoria = strtolower(trim((string) $partes[2]));
+        $data = trim((string) $partes[3]);
+
+        $tipoValido = in_array($tipo, ['receita', 'despesa'], true);
+        $valorValido = is_numeric($valorRaw) && (float) $valorRaw > 0;
+        $dataValida = (bool) preg_match('/^\d{4}-\d{2}-\d{2}$/', $data);
+
+        if ($tipoValido && $valorValido && $dataValida) {
+            salvarTransacao($conn, $usuarioId, $tipo, (float) $valorRaw, $categoria, $data);
+
+            $saldo = buscarSaldo($conn, $usuarioId);
+
+            enviarMensagem(
+                $chatId,
+                "✅ Transação registrada.\n\nSaldo atual: " . formatarReal($saldo['saldo']),
+                $TOKEN
+            );
+
+            responderOk();
+        }
+    }
+
+    enviarMensagem(
+        $chatId,
+        "Comando não reconhecido.\n\nUse:\n/vincular SEU_CODIGO\n/saldo\n\nOu registre transações assim:\nreceita 500 salario 2026-03-19\ndespesa 120 mercado 2026-03-19",
+        $TOKEN
+    );
+
+    responderOk();
+
+} catch (Throwable $e) {
+    error_log('Erro no webhook: ' . $e->getMessage());
+    responderOk();
 }
-
-enviarMensagem(
-    $chatId,
-    "Comando não reconhecido.\n\nUse:\n/vincular SEU_CODIGO\n/saldo",
-    $TOKEN
-);
-
-responderOk();
