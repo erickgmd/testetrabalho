@@ -112,15 +112,11 @@ if (!$chatId) {
 }
 
 if ($message === '/start') {
-    $texto = "Olá, {$nomeTelegram}.\n\n"
-        . "Para começar, vincule sua conta do site com:\n"
-        . "/vincular SEU_CODIGO\n\n"
-        . "Depois você poderá usar:\n"
-        . "/saldo\n"
-        . "receita 500 salario 2026-03-19\n"
-        . "despesa 120 mercado 2026-03-19";
-
-    enviarMensagem($chatId, $texto, $TOKEN);
+    enviarMensagem(
+        $chatId,
+        "Olá, {$nomeTelegram}.\n\nPara vincular sua conta, envie:\n/vincular SEU_CODIGO\n\nDepois você poderá usar:\n/saldo",
+        $TOKEN
+    );
     responderOk();
 }
 
@@ -165,7 +161,7 @@ if (str_starts_with($message, '/vincular')) {
         ':id' => $vinculo['id']
     ]);
 
-    enviarMensagem($chatId, "Conta vinculada com sucesso ao Cash Flow.", $TOKEN);
+    enviarMensagem($chatId, "Conta vinculada com sucesso.", $TOKEN);
     responderOk();
 }
 
@@ -174,7 +170,7 @@ $usuario = buscarUsuarioVinculado($conn, $chatId);
 if (!$usuario) {
     enviarMensagem(
         $chatId,
-        "Sua conta ainda não está vinculada.\n\nAcesse o site, gere seu código e envie:\n/vincular SEU_CODIGO",
+        "Sua conta ainda não está vinculada.\n\nEnvie:\n/vincular SEU_CODIGO",
         $TOKEN
     );
     responderOk();
@@ -213,7 +209,7 @@ if (count($partes) >= 4) {
 
         enviarMensagem(
             $chatId,
-            "✅ Transação registrada com sucesso.\n\nSaldo atual: " . formatarReal($saldo['saldo']),
+            "✅ Transação registrada.\n\nSaldo atual: " . formatarReal($saldo['saldo']),
             $TOKEN
         );
 
@@ -223,11 +219,7 @@ if (count($partes) >= 4) {
 
 enviarMensagem(
     $chatId,
-    "Não entendi sua mensagem.\n\nUse:\n"
-    . "/saldo\n"
-    . "/vincular SEU_CODIGO\n"
-    . "receita 500 salario 2026-03-19\n"
-    . "despesa 120 mercado 2026-03-19",
+    "Comando não reconhecido.\n\nUse:\n/vincular SEU_CODIGO\n/saldo",
     $TOKEN
 );
 
