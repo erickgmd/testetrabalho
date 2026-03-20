@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 require __DIR__ . '/db.php';
 
-$TOKEN = '8308783962:AAFpg2xrjevfet-q-6jt2kHNc7n_IFMstt8';
+$TOKEN = 'COLOQUE_SEU_NOVO_TOKEN_AQUI';
 
 function responderOk(): void
 {
@@ -57,81 +57,139 @@ function buscarUsuarioVinculado(PDO $conn, int|string $telegramId): ?array
     return $usuario ?: null;
 }
 
-function buscarSaldo(PDO $conn, int $usuarioId): array
+function buscarSaldoAtual(PDO $conn, int $usuarioId): float
+{
+    $stmt = $conn->prepare("
+        SELECT COALESCE(saldo_total, 0) AS saldo_total
+        FROM transacoes
+        WHERE usuario_id = :usuario_id
+        ORDER BY data_transacao DESC, criado_em DESC, id DESC
+        LIMIT 1
+    ");
+    $stmt->execute([':usuario_id' => $usuarioId]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    return (float)($row['saldo_total'] ?? 0);
+}
+
+function buscarResumo(PDO $conn, int $usuarioId): array
 {
     $stmt = $conn->prepare("
         SELECT
-            COALESCE(SUM(CASE WHEN tipo = 'receita' THEN valor ELSE 0 END), 0) AS receitas,
-            COALESCE(SUM(CASE WHEN tipo = 'despesa' THEN valor ELSE 0 END), 0) AS despesas
+            COALESCE(SUM(CASE WHEN tipo = 'income' THEN valor ELSE 0 END), 0) AS receitas,
+            COALESCE(SUM(CASE WHEN tipo = 'expense' THEN valor ELSE 0 END), 0) AS despesas
         FROM transacoes
         WHERE usuario_id = :usuario_id
     ");
     $stmt->execute([':usuario_id' => $usuarioId]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
-    $receitas = (float) ($row['receitas'] ?? 0);
-    $despesas = (float) ($row['despesas'] ?? 0);
+    $receitas = (float)($row['receitas'] ?? 0);
+    $despesas = (float)($row['despesas'] ?? 0);
+    $saldo = buscarSaldoAtual($conn, $usuarioId);
 
     return [
         'receitas' => $receitas,
         'despesas' => $despesas,
-        'saldo' => $receitas - $despesas
+        'saldo' => $saldo
     ];
 }
 
 function salvarTransacao(
     PDO $conn,
     int $usuarioId,
-    string $tipo,
+    string $descricao,
     float $valor,
     string $categoria,
+    string $tipo,
     string $data
 ): void {
+    $stmtSaldo = $conn->prepare("
+        SELECT COALESCE(saldo_total, 0) AS saldo_total
+        FROM transacoes
+        WHERE usuario_id = :usuario_id
+        ORDER BY data_transacao DESC, criado_em DESC, id DESC
+        LIMIT 1
+    ");
+    $stmtSaldo->execute([
+        ':usuario_id' => $usuarioId
+    ]);
+
+    $ultima = $stmtSaldo->fetch(PDO::FETCH_ASSOC);
+    $saldoAnterior = (float)($ultima['saldo_total'] ?? 0);
+
+    $novoSaldo = $tipo === 'income'
+        ? $saldoAnterior + $valor
+        : $saldoAnterior - $valor;
+
     $stmt = $conn->prepare("
-        INSERT INTO transacoes (usuario_id, tipo, valor, categoria, data)
-        VALUES (:usuario_id, :tipo, :valor, :categoria, :data)
+        INSERT INTO transacoes (
+            usuario_id,
+            descricao,
+            valor,
+            categoria,
+            tipo,
+            data_transacao,
+            saldo_total
+        ) VALUES (
+            :usuario_id,
+            :descricao,
+            :valor,
+            :categoria,
+            :tipo,
+            :data_transacao,
+            :saldo_total
+        )
     ");
 
     $stmt->execute([
         ':usuario_id' => $usuarioId,
-        ':tipo' => $tipo,
+        ':descricao' => $descricao,
         ':valor' => $valor,
         ':categoria' => $categoria,
-        ':data' => $data
+        ':tipo' => $tipo,
+        ':data_transacao' => $data,
+        ':saldo_total' => $novoSaldo
     ]);
 }
 
-/**
- * Formatos aceitos:
- * receita 500 salario 2026-03-19
- * despesa 120 mercado 2026-03-19
- * despesas 120 mercado extra 2026-03-19
- * receitas 250 freelance 2026-03-19
- */
+/*
+Formatos aceitos:
+receita 5000 salario salario 2026-03-19
+despesa 1000 aluguel de jetski transporte 2026-03-19
+
+Regra:
+- palavra 1 = tipo
+- palavra 2 = valor
+- última = data
+- penúltima = categoria
+- meio = descrição
+*/
 function interpretarTransacao(string $message): ?array
 {
     $partes = preg_split('/\s+/', trim($message));
 
-    if (!$partes || count($partes) < 4) {
+    if (!$partes || count($partes) < 5) {
         return null;
     }
 
     $tipoBruto = strtolower(trim((string)$partes[0]));
     $valorBruto = str_replace(',', '.', trim((string)$partes[1]));
     $data = trim((string)$partes[count($partes) - 1]);
+    $categoria = strtolower(trim((string)$partes[count($partes) - 2]));
+    $descricaoPartes = array_slice($partes, 2, -2);
+    $descricao = trim(implode(' ', $descricaoPartes));
 
     $mapaTipos = [
-        'receita' => 'receita',
-        'receitas' => 'receita',
-        'despesa' => 'despesa',
-        'despesas' => 'despesa',
+        'receita' => 'income',
+        'receitas' => 'income',
+        'despesa' => 'expense',
+        'despesas' => 'expense'
     ];
 
     if (!isset($mapaTipos[$tipoBruto])) {
         return null;
     }
-
-    $tipo = $mapaTipos[$tipoBruto];
 
     if (!is_numeric($valorBruto) || (float)$valorBruto <= 0) {
         return null;
@@ -141,17 +199,15 @@ function interpretarTransacao(string $message): ?array
         return null;
     }
 
-    $categoriaPartes = array_slice($partes, 2, -1);
-    $categoria = trim(implode(' ', $categoriaPartes));
-
-    if ($categoria === '') {
+    if ($descricao === '' || $categoria === '') {
         return null;
     }
 
     return [
-        'tipo' => $tipo,
+        'tipo' => $mapaTipos[$tipoBruto],
         'valor' => (float)$valorBruto,
-        'categoria' => strtolower($categoria),
+        'descricao' => $descricao,
+        'categoria' => $categoria,
         'data' => $data
     ];
 }
@@ -180,7 +236,7 @@ try {
     if ($message === '/start') {
         enviarMensagem(
             $chatId,
-            "Olá, {$nomeTelegram}.\n\nPara vincular sua conta, envie:\n/vincular SEU_CODIGO\n\nDepois use:\n/saldo\n\nExemplos de transação:\nreceita 500 salario 2026-03-19\ndespesa 120 mercado 2026-03-19",
+            "Olá, {$nomeTelegram}.\n\nPara vincular sua conta:\n/vincular SEU_CODIGO\n\nPara consultar saldo:\n/saldo\n\nPara lançar transação:\nreceita 5000 salario salario 2026-03-19\ndespesa 1000 aluguel de jetski transporte 2026-03-19",
             $TOKEN
         );
         responderOk();
@@ -245,12 +301,12 @@ try {
     $usuarioId = (int)$usuario['id'];
 
     if ($message === '/saldo') {
-        $saldo = buscarSaldo($conn, $usuarioId);
+        $resumo = buscarResumo($conn, $usuarioId);
 
         $texto = "💰 Saldo atual\n\n"
-            . "Receitas: " . formatarReal($saldo['receitas']) . "\n"
-            . "Despesas: " . formatarReal($saldo['despesas']) . "\n"
-            . "Saldo: " . formatarReal($saldo['saldo']);
+            . "Receitas: " . formatarReal($resumo['receitas']) . "\n"
+            . "Despesas: " . formatarReal($resumo['despesas']) . "\n"
+            . "Saldo total: " . formatarReal($resumo['saldo']);
 
         enviarMensagem($chatId, $texto, $TOKEN);
         responderOk();
@@ -262,21 +318,24 @@ try {
         salvarTransacao(
             $conn,
             $usuarioId,
-            $transacao['tipo'],
+            $transacao['descricao'],
             $transacao['valor'],
             $transacao['categoria'],
+            $transacao['tipo'],
             $transacao['data']
         );
 
-        $saldo = buscarSaldo($conn, $usuarioId);
+        $saldoAtual = buscarSaldoAtual($conn, $usuarioId);
 
         enviarMensagem(
             $chatId,
-            "✅ " . ucfirst($transacao['tipo']) . " registrada.\n"
+            "✅ Transação registrada.\n\n"
+            . "Descrição: {$transacao['descricao']}\n"
             . "Categoria: {$transacao['categoria']}\n"
             . "Valor: " . formatarReal($transacao['valor']) . "\n"
+            . "Tipo: {$transacao['tipo']}\n"
             . "Data: {$transacao['data']}\n\n"
-            . "Saldo atual: " . formatarReal($saldo['saldo']),
+            . "Saldo total: " . formatarReal($saldoAtual),
             $TOKEN
         );
 
@@ -285,7 +344,7 @@ try {
 
     enviarMensagem(
         $chatId,
-        "Comando não reconhecido.\n\nUse:\n/vincular SEU_CODIGO\n/saldo\n\nExemplos:\nreceita 500 salario 2026-03-19\ndespesa 120 mercado 2026-03-19",
+        "Comando não reconhecido.\n\nUse:\n/vincular SEU_CODIGO\n/saldo\n\nExemplo:\nreceita 5000 salario salario 2026-03-19\ndespesa 1000 aluguel de jetski transporte 2026-03-19",
         $TOKEN
     );
 
