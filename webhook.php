@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 require __DIR__ . '/db.php';
 
-$TOKEN = 'COLOQUE_SEU_NOVO_TOKEN_AQUI';
+$TOKEN = '8308783962:AAFpg2xrjevfet-q-6jt2kHNc7n_IFMstt8';
 
 function responderOk(): void
 {
