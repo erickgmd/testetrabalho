@@ -95,6 +95,70 @@ function buscarResumo(PDO $conn, int $usuarioId): array
     ];
 }
 
+function buscarExtrato(PDO $conn, int $usuarioId): array
+{
+    $stmt = $conn->prepare("
+        SELECT descricao, valor, tipo, categoria, data_transacao
+        FROM transacoes
+        WHERE usuario_id = :usuario_id
+        ORDER BY data_transacao DESC, criado_em DESC, id DESC
+        LIMIT 5
+    ");
+    $stmt->execute([':usuario_id' => $usuarioId]);
+
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+function detectarCategoria(string $descricao): string
+{
+    $descricao = strtolower($descricao);
+
+    if (
+        str_contains($descricao, 'ifood') ||
+        str_contains($descricao, 'mercado') ||
+        str_contains($descricao, 'restaurante') ||
+        str_contains($descricao, 'lanche')
+    ) {
+        return 'alimentacao';
+    }
+
+    if (
+        str_contains($descricao, 'uber') ||
+        str_contains($descricao, 'gasolina') ||
+        str_contains($descricao, 'combustivel') ||
+        str_contains($descricao, 'onibus')
+    ) {
+        return 'transporte';
+    }
+
+    if (
+        str_contains($descricao, 'aluguel') ||
+        str_contains($descricao, 'condominio') ||
+        str_contains($descricao, 'energia') ||
+        str_contains($descricao, 'agua')
+    ) {
+        return 'moradia';
+    }
+
+    if (
+        str_contains($descricao, 'academia') ||
+        str_contains($descricao, 'farmacia') ||
+        str_contains($descricao, 'consulta')
+    ) {
+        return 'saude';
+    }
+
+    if (
+        str_contains($descricao, 'freelance') ||
+        str_contains($descricao, 'salario') ||
+        str_contains($descricao, 'pagamento')
+    ) {
+        return 'renda';
+    }
+
+    return 'outros';
+}
+
 function salvarTransacao(
     PDO $conn,
     int $usuarioId,
@@ -155,14 +219,23 @@ function salvarTransacao(
 
 /*
 Formatos aceitos:
-receita 5000 salario salario 2026-03-19
-despesa 1000 aluguel de jetski transporte 2026-03-19
+
+1) Manual completo
+receita 5000 salario renda 2026-03-19
+despesa 1000 aluguel transporte 2026-03-19
+
+2) Com data automática
+despesa 120 mercado alimentacao hoje
+receita 500 freelance renda ontem
+
+3) Com categoria automática
+despesa 50 ifood auto hoje
 
 Regra:
 - palavra 1 = tipo
 - palavra 2 = valor
-- última = data
-- penúltima = categoria
+- última = data|hoje|ontem
+- penúltima = categoria|auto
 - meio = descrição
 */
 function interpretarTransacao(string $message): ?array
@@ -175,8 +248,8 @@ function interpretarTransacao(string $message): ?array
 
     $tipoBruto = strtolower(trim((string)$partes[0]));
     $valorBruto = str_replace(',', '.', trim((string)$partes[1]));
-    $data = trim((string)$partes[count($partes) - 1]);
-    $categoria = strtolower(trim((string)$partes[count($partes) - 2]));
+    $dataRaw = strtolower(trim((string)$partes[count($partes) - 1]));
+    $categoriaRaw = strtolower(trim((string)$partes[count($partes) - 2]));
     $descricaoPartes = array_slice($partes, 2, -2);
     $descricao = trim(implode(' ', $descricaoPartes));
 
@@ -195,11 +268,27 @@ function interpretarTransacao(string $message): ?array
         return null;
     }
 
+    if ($dataRaw === 'hoje') {
+        $data = date('Y-m-d');
+    } elseif ($dataRaw === 'ontem') {
+        $data = date('Y-m-d', strtotime('-1 day'));
+    } else {
+        $data = $dataRaw;
+    }
+
     if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $data)) {
         return null;
     }
 
-    if ($descricao === '' || $categoria === '') {
+    if ($descricao === '') {
+        return null;
+    }
+
+    $categoria = $categoriaRaw === 'auto'
+        ? detectarCategoria($descricao)
+        : $categoriaRaw;
+
+    if ($categoria === '') {
         return null;
     }
 
@@ -236,7 +325,7 @@ try {
     if ($message === '/start') {
         enviarMensagem(
             $chatId,
-            "Olá, {$nomeTelegram}.\n\nPara vincular sua conta:\n/vincular SEU_CODIGO\n\nPara consultar saldo:\n/saldo\n\nPara lançar transação:\nreceita 5000 salario salario 2026-03-19\ndespesa 1000 aluguel de jetski transporte 2026-03-19",
+            "Olá, {$nomeTelegram}.\n\nPara vincular sua conta:\n/vincular SEU_CODIGO\n\nComandos disponíveis:\n/saldo\n/extrato\n\nExemplos:\nreceita 5000 salario renda 2026-03-19\ndespesa 100 mercado alimentacao hoje\ndespesa 50 ifood auto hoje",
             $TOKEN
         );
         responderOk();
@@ -312,6 +401,31 @@ try {
         responderOk();
     }
 
+    if ($message === '/extrato') {
+        $extrato = buscarExtrato($conn, $usuarioId);
+
+        if (empty($extrato)) {
+            enviarMensagem($chatId, "Nenhuma transação encontrada.", $TOKEN);
+            responderOk();
+        }
+
+        $texto = "📊 Últimas transações:\n\n";
+
+        foreach ($extrato as $t) {
+            $sinal = $t['tipo'] === 'income' ? '+' : '-';
+            $texto .= $t['descricao']
+                . " | " . $t['categoria']
+                . " | " . $sinal . formatarReal((float)$t['valor'])
+                . " | " . $t['data_transacao'] . "\n";
+        }
+
+        $saldo = buscarSaldoAtual($conn, $usuarioId);
+        $texto .= "\n💰 Saldo: " . formatarReal($saldo);
+
+        enviarMensagem($chatId, $texto, $TOKEN);
+        responderOk();
+    }
+
     $transacao = interpretarTransacao($message);
 
     if ($transacao !== null) {
@@ -344,7 +458,7 @@ try {
 
     enviarMensagem(
         $chatId,
-        "Comando não reconhecido.\n\nUse:\n/vincular SEU_CODIGO\n/saldo\n\nExemplo:\nreceita 5000 salario salario 2026-03-19\ndespesa 1000 aluguel de jetski transporte 2026-03-19",
+        "Comando não reconhecido.\n\nUse:\n/vincular SEU_CODIGO\n/saldo\n/extrato\n\nExemplos:\nreceita 5000 salario renda 2026-03-19\ndespesa 120 mercado alimentacao hoje\ndespesa 50 ifood auto hoje",
         $TOKEN
     );
 
