@@ -58,6 +58,40 @@ function normalizarTexto(string $texto): string
     return strtr($texto, $mapa);
 }
 
+function converterDataEntrada(string $data): ?string
+{
+    $data = trim(normalizarTexto($data));
+
+    if ($data === 'hoje') {
+        return date('Y-m-d');
+    }
+
+    if ($data === 'ontem') {
+        return date('Y-m-d', strtotime('-1 day'));
+    }
+
+    if (preg_match('/^\d{2}\/\d{2}\/\d{4}$/', $data)) {
+        [$dia, $mes, $ano] = explode('/', $data);
+        return "{$ano}-{$mes}-{$dia}";
+    }
+
+    if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $data)) {
+        return $data;
+    }
+
+    return null;
+}
+
+function formatarDataBR(string $data): string
+{
+    $timestamp = strtotime($data);
+    if ($timestamp === false) {
+        return $data;
+    }
+
+    return date('d/m/Y', $timestamp);
+}
+
 function buscarUsuarioVinculado(PDO $conn, int|string $telegramId): ?array
 {
     $stmt = $conn->prepare("
@@ -111,16 +145,36 @@ function buscarResumo(PDO $conn, int $usuarioId): array
     ];
 }
 
-function buscarExtrato(PDO $conn, int $usuarioId): array
+function buscarExtrato(PDO $conn, int $usuarioId, ?string $inicio = null, ?string $fim = null): array
 {
-    $stmt = $conn->prepare("
-        SELECT descricao, valor, tipo, categoria, data_transacao
-        FROM transacoes
-        WHERE usuario_id = :usuario_id
-        ORDER BY data_transacao DESC, criado_em DESC, id DESC
-        LIMIT 5
-    ");
-    $stmt->execute([':usuario_id' => $usuarioId]);
+    if ($inicio && $fim) {
+        $stmt = $conn->prepare("
+            SELECT descricao, valor, tipo, categoria, data_transacao
+            FROM transacoes
+            WHERE usuario_id = :usuario_id
+              AND data_transacao BETWEEN :inicio AND :fim
+            ORDER BY data_transacao DESC, criado_em DESC, id DESC
+            LIMIT 100
+        ");
+
+        $stmt->execute([
+            ':usuario_id' => $usuarioId,
+            ':inicio' => $inicio,
+            ':fim' => $fim
+        ]);
+    } else {
+        $stmt = $conn->prepare("
+            SELECT descricao, valor, tipo, categoria, data_transacao
+            FROM transacoes
+            WHERE usuario_id = :usuario_id
+            ORDER BY data_transacao DESC, criado_em DESC, id DESC
+            LIMIT 5
+        ");
+
+        $stmt->execute([
+            ':usuario_id' => $usuarioId
+        ]);
+    }
 
     return $stmt->fetchAll(PDO::FETCH_ASSOC);
 }
@@ -285,7 +339,7 @@ function interpretarTransacao(string $message): ?array
 
     $tipoBruto = normalizarTexto((string)$partes[0]);
     $valorBruto = str_replace(',', '.', trim((string)$partes[1]));
-    $dataRaw = normalizarTexto((string)$partes[count($partes) - 1]);
+    $dataRaw = (string)$partes[count($partes) - 1];
     $categoriaRaw = normalizarTexto((string)$partes[count($partes) - 2]);
     $descricaoPartes = array_slice($partes, 2, -2);
     $descricao = trim(implode(' ', $descricaoPartes));
@@ -305,15 +359,8 @@ function interpretarTransacao(string $message): ?array
         return null;
     }
 
-    if ($dataRaw === 'hoje') {
-        $data = date('Y-m-d');
-    } elseif ($dataRaw === 'ontem') {
-        $data = date('Y-m-d', strtotime('-1 day'));
-    } else {
-        $data = $dataRaw;
-    }
-
-    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $data)) {
+    $data = converterDataEntrada($dataRaw);
+    if ($data === null) {
         return null;
     }
 
@@ -391,6 +438,42 @@ function interpretarNatural(string $message): ?array
     return null;
 }
 
+function interpretarComandoExtrato(string $message): ?array
+{
+    $partes = preg_split('/\s+/', trim($message));
+
+    if (!$partes || count($partes) === 0) {
+        return null;
+    }
+
+    $comando = normalizarTexto((string)$partes[0]);
+
+    if (!in_array($comando, ['extrato', '/extrato'], true)) {
+        return null;
+    }
+
+    if (count($partes) === 1) {
+        return ['tipo' => 'ultimos'];
+    }
+
+    if (count($partes) === 3) {
+        $inicio = converterDataEntrada((string)$partes[1]);
+        $fim = converterDataEntrada((string)$partes[2]);
+
+        if (!$inicio || !$fim) {
+            return ['tipo' => 'erro'];
+        }
+
+        return [
+            'tipo' => 'periodo',
+            'inicio' => $inicio,
+            'fim' => $fim
+        ];
+    }
+
+    return ['tipo' => 'erro'];
+}
+
 try {
     $inputRaw = file_get_contents('php://input');
 
@@ -416,7 +499,7 @@ try {
     if ($messageNormalizada === '/start' || $messageNormalizada === 'start') {
         enviarMensagem(
             $chatId,
-            "Olá, {$nomeTelegram}.\n\nPara vincular sua conta:\nvincular SEU_CODIGO\n\nComandos disponíveis:\nsaldo\nextrato\ninsights\n\nExemplos:\nreceita 5000 salario renda 2026-03-19\ndespesa 100 mercado alimentacao hoje\ndespesa 50 ifood auto hoje\ngastei 30 no uber hoje\nrecebi 500 freelance hoje",
+            "Olá, {$nomeTelegram}.\n\nPara vincular sua conta:\nvincular SEU_CODIGO\n\nComandos disponíveis:\nsaldo\nextrato\nextrato 01/03/2026 31/03/2026\ninsights\n\nExemplos:\nreceita 5000 salario renda 19/03/2026\ndespesa 100 mercado alimentacao hoje\ndespesa 50 ifood auto ontem\ngastei 30 no uber hoje\nrecebi 500 freelance hoje",
             $TOKEN
         );
         responderOk();
@@ -492,29 +575,93 @@ try {
         responderOk();
     }
 
-    if ($messageNormalizada === '/extrato' || $messageNormalizada === 'extrato') {
-        $extrato = buscarExtrato($conn, $usuarioId);
+    $extratoCmd = interpretarComandoExtrato($messageOriginal);
 
-        if (empty($extrato)) {
-            enviarMensagem($chatId, "Nenhuma transação encontrada.", $TOKEN);
+    if ($extratoCmd !== null) {
+        if ($extratoCmd['tipo'] === 'erro') {
+            enviarMensagem(
+                $chatId,
+                "Formato inválido.\n\nUse:\nextrato\nou\nextrato 01/03/2026 31/03/2026",
+                $TOKEN
+            );
             responderOk();
         }
 
-        $texto = "📊 Últimas transações:\n\n";
+        if ($extratoCmd['tipo'] === 'ultimos') {
+            $extrato = buscarExtrato($conn, $usuarioId);
 
-        foreach ($extrato as $t) {
-            $sinal = $t['tipo'] === 'income' ? '+' : '-';
-            $texto .= $t['descricao']
-                . " | " . $t['categoria']
-                . " | " . $sinal . formatarReal((float)$t['valor'])
-                . " | " . $t['data_transacao'] . "\n";
+            if (empty($extrato)) {
+                enviarMensagem($chatId, "Nenhuma transação encontrada.", $TOKEN);
+                responderOk();
+            }
+
+            $texto = "📊 Últimas transações:\n\n";
+
+            foreach ($extrato as $t) {
+                $sinal = $t['tipo'] === 'income' ? '+' : '-';
+                $texto .= $t['descricao']
+                    . " | " . $t['categoria']
+                    . " | " . $sinal . formatarReal((float)$t['valor'])
+                    . " | " . formatarDataBR((string)$t['data_transacao']) . "\n";
+            }
+
+            $saldo = buscarSaldoAtual($conn, $usuarioId);
+            $texto .= "\n💰 Saldo: " . formatarReal($saldo);
+
+            enviarMensagem($chatId, $texto, $TOKEN);
+            responderOk();
         }
 
-        $saldo = buscarSaldoAtual($conn, $usuarioId);
-        $texto .= "\n💰 Saldo: " . formatarReal($saldo);
+        if ($extratoCmd['tipo'] === 'periodo') {
+            $extrato = buscarExtrato(
+                $conn,
+                $usuarioId,
+                $extratoCmd['inicio'],
+                $extratoCmd['fim']
+            );
 
-        enviarMensagem($chatId, $texto, $TOKEN);
-        responderOk();
+            if (empty($extrato)) {
+                enviarMensagem(
+                    $chatId,
+                    "Nenhuma transação encontrada no período de "
+                    . formatarDataBR($extratoCmd['inicio'])
+                    . " até "
+                    . formatarDataBR($extratoCmd['fim'])
+                    . ".",
+                    $TOKEN
+                );
+                responderOk();
+            }
+
+            $texto = "📊 Extrato do período\n";
+            $texto .= formatarDataBR($extratoCmd['inicio']) . " até " . formatarDataBR($extratoCmd['fim']) . "\n\n";
+
+            $receitas = 0.0;
+            $despesas = 0.0;
+
+            foreach ($extrato as $t) {
+                $valor = (float)$t['valor'];
+                $sinal = $t['tipo'] === 'income' ? '+' : '-';
+
+                if ($t['tipo'] === 'income') {
+                    $receitas += $valor;
+                } else {
+                    $despesas += $valor;
+                }
+
+                $texto .= $t['descricao']
+                    . " | " . $t['categoria']
+                    . " | " . $sinal . formatarReal($valor)
+                    . " | " . formatarDataBR((string)$t['data_transacao']) . "\n";
+            }
+
+            $texto .= "\nReceitas no período: " . formatarReal($receitas);
+            $texto .= "\nDespesas no período: " . formatarReal($despesas);
+            $texto .= "\nSaldo no período: " . formatarReal($receitas - $despesas);
+
+            enviarMensagem($chatId, $texto, $TOKEN);
+            responderOk();
+        }
     }
 
     if ($messageNormalizada === '/insights' || $messageNormalizada === 'insights') {
@@ -549,7 +696,7 @@ try {
             . "Categoria: {$transacao['categoria']}\n"
             . "Valor: " . formatarReal($transacao['valor']) . "\n"
             . "Tipo: {$transacao['tipo']}\n"
-            . "Data: {$transacao['data']}\n\n"
+            . "Data: " . formatarDataBR($transacao['data']) . "\n\n"
             . "Saldo total: " . formatarReal($saldoAtual),
             $TOKEN
         );
@@ -559,7 +706,7 @@ try {
 
     enviarMensagem(
         $chatId,
-        "Comando não reconhecido.\n\nUse:\nvincular SEU_CODIGO\nsaldo\nextrato\ninsights\n\nExemplos:\nreceita 5000 salario renda 2026-03-19\ndespesa 120 mercado alimentacao hoje\ndespesa 50 ifood auto hoje\ngastei 30 no uber hoje\nrecebi 500 freelance hoje",
+        "Comando não reconhecido.\n\nUse:\nvincular SEU_CODIGO\nsaldo\nextrato\nextrato 01/03/2026 31/03/2026\ninsights\n\nExemplos:\nreceita 5000 salario renda 19/03/2026\ndespesa 120 mercado alimentacao hoje\ndespesa 50 ifood auto ontem\ngastei 30 no uber hoje\nrecebi 500 freelance hoje",
         $TOKEN
     );
 
