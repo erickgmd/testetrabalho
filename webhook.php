@@ -125,6 +125,47 @@ function buscarExtrato(PDO $conn, int $usuarioId): array
     return $stmt->fetchAll(PDO::FETCH_ASSOC);
 }
 
+function gerarInsights(PDO $conn, int $usuarioId): string
+{
+    $stmt = $conn->prepare("
+        SELECT categoria, tipo, SUM(valor) AS total
+        FROM transacoes
+        WHERE usuario_id = :usuario_id
+        GROUP BY categoria, tipo
+    ");
+    $stmt->execute([':usuario_id' => $usuarioId]);
+    $dados = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    if (!$dados) {
+        return "Sem dados suficientes para gerar insights.";
+    }
+
+    $gastos = [];
+    $receitas = 0.0;
+    $despesas = 0.0;
+
+    foreach ($dados as $d) {
+        $total = (float)$d['total'];
+
+        if ($d['tipo'] === 'income') {
+            $receitas += $total;
+        } else {
+            $despesas += $total;
+            $gastos[$d['categoria']] = $total;
+        }
+    }
+
+    arsort($gastos);
+    $topCategoria = array_key_first($gastos);
+    $topValor = $gastos[$topCategoria] ?? 0;
+
+    return "📊 Insights\n\n"
+        . "Maior gasto: " . ($topCategoria ?? 'N/A') . " (" . formatarReal((float)$topValor) . ")\n"
+        . "Receitas: " . formatarReal($receitas) . "\n"
+        . "Despesas: " . formatarReal($despesas) . "\n"
+        . "Saldo: " . formatarReal($receitas - $despesas);
+}
+
 function detectarCategoria(string $descricao): string
 {
     $descricao = normalizarTexto($descricao);
@@ -167,7 +208,8 @@ function detectarCategoria(string $descricao): string
     if (
         str_contains($descricao, 'freelance') ||
         str_contains($descricao, 'salario') ||
-        str_contains($descricao, 'pagamento')
+        str_contains($descricao, 'pagamento') ||
+        str_contains($descricao, 'empresa')
     ) {
         return 'renda';
     }
@@ -296,6 +338,59 @@ function interpretarTransacao(string $message): ?array
     ];
 }
 
+function interpretarNatural(string $message): ?array
+{
+    $msg = normalizarTexto($message);
+
+    if (preg_match('/^gastei\s+(\d+(?:[.,]\d+)?)/', $msg, $m)) {
+        $valor = (float)str_replace(',', '.', $m[1]);
+
+        $data = date('Y-m-d');
+        if (str_contains($msg, ' ontem')) {
+            $data = date('Y-m-d', strtotime('-1 day'));
+        }
+
+        if (preg_match('/gastei\s+\d+(?:[.,]\d+)?\s+(?:no|na|com)\s+(.+?)(?:\s+hoje|\s+ontem|$)/', $msg, $descMatch)) {
+            $descricao = trim($descMatch[1]);
+        } else {
+            $descricao = 'gasto';
+        }
+
+        return [
+            'tipo' => 'expense',
+            'valor' => $valor,
+            'descricao' => $descricao,
+            'categoria' => detectarCategoria($descricao),
+            'data' => $data
+        ];
+    }
+
+    if (preg_match('/^recebi\s+(\d+(?:[.,]\d+)?)/', $msg, $m)) {
+        $valor = (float)str_replace(',', '.', $m[1]);
+
+        $data = date('Y-m-d');
+        if (str_contains($msg, ' ontem')) {
+            $data = date('Y-m-d', strtotime('-1 day'));
+        }
+
+        if (preg_match('/recebi\s+\d+(?:[.,]\d+)?\s+(.+?)(?:\s+hoje|\s+ontem|$)/', $msg, $descMatch)) {
+            $descricao = trim($descMatch[1]);
+        } else {
+            $descricao = 'renda';
+        }
+
+        return [
+            'tipo' => 'income',
+            'valor' => $valor,
+            'descricao' => $descricao,
+            'categoria' => detectarCategoria($descricao),
+            'data' => $data
+        ];
+    }
+
+    return null;
+}
+
 try {
     $inputRaw = file_get_contents('php://input');
 
@@ -321,7 +416,7 @@ try {
     if ($messageNormalizada === '/start' || $messageNormalizada === 'start') {
         enviarMensagem(
             $chatId,
-            "Olá, {$nomeTelegram}.\n\nPara vincular sua conta:\n/vincular SEU_CODIGO\n\nComandos disponíveis:\nsaldo\nextrato\n\nExemplos:\nreceita 5000 salario renda 2026-03-19\ndespesa 100 mercado alimentacao hoje\ndespesa 50 ifood auto hoje",
+            "Olá, {$nomeTelegram}.\n\nPara vincular sua conta:\nvincular SEU_CODIGO\n\nComandos disponíveis:\nsaldo\nextrato\ninsights\n\nExemplos:\nreceita 5000 salario renda 2026-03-19\ndespesa 100 mercado alimentacao hoje\ndespesa 50 ifood auto hoje\ngastei 30 no uber hoje\nrecebi 500 freelance hoje",
             $TOKEN
         );
         responderOk();
@@ -422,7 +517,17 @@ try {
         responderOk();
     }
 
-    $transacao = interpretarTransacao($messageOriginal);
+    if ($messageNormalizada === '/insights' || $messageNormalizada === 'insights') {
+        $texto = gerarInsights($conn, $usuarioId);
+        enviarMensagem($chatId, $texto, $TOKEN);
+        responderOk();
+    }
+
+    $transacao = interpretarNatural($messageOriginal);
+
+    if ($transacao === null) {
+        $transacao = interpretarTransacao($messageOriginal);
+    }
 
     if ($transacao !== null) {
         salvarTransacao(
@@ -454,7 +559,7 @@ try {
 
     enviarMensagem(
         $chatId,
-        "Comando não reconhecido.\n\nUse:\nvincular SEU_CODIGO\nsaldo\nextrato\n\nExemplos:\nreceita 5000 salario renda 2026-03-19\ndespesa 120 mercado alimentacao hoje\ndespesa 50 ifood auto hoje",
+        "Comando não reconhecido.\n\nUse:\nvincular SEU_CODIGO\nsaldo\nextrato\ninsights\n\nExemplos:\nreceita 5000 salario renda 2026-03-19\ndespesa 120 mercado alimentacao hoje\ndespesa 50 ifood auto hoje\ngastei 30 no uber hoje\nrecebi 500 freelance hoje",
         $TOKEN
     );
 
