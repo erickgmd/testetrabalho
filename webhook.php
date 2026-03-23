@@ -42,22 +42,6 @@ function formatarReal(float $valor): string
     return 'R$ ' . number_format($valor, 2, ',', '.');
 }
 
-function normalizarTexto(string $texto): string
-{
-    $texto = trim(mb_strtolower($texto, 'UTF-8'));
-
-    $mapa = [
-        'á' => 'a', 'à' => 'a', 'ã' => 'a', 'â' => 'a',
-        'é' => 'e', 'ê' => 'e',
-        'í' => 'i',
-        'ó' => 'o', 'ô' => 'o', 'õ' => 'o',
-        'ú' => 'u',
-        'ç' => 'c'
-    ];
-
-    return strtr($texto, $mapa);
-}
-
 function buscarUsuarioVinculado(PDO $conn, int|string $telegramId): ?array
 {
     $stmt = $conn->prepare("
@@ -127,7 +111,7 @@ function buscarExtrato(PDO $conn, int $usuarioId): array
 
 function detectarCategoria(string $descricao): string
 {
-    $descricao = normalizarTexto($descricao);
+    $descricao = strtolower($descricao);
 
     if (
         str_contains($descricao, 'ifood') ||
@@ -233,6 +217,27 @@ function salvarTransacao(
     ]);
 }
 
+/*
+Formatos aceitos:
+
+1) Manual completo
+receita 5000 salario renda 2026-03-19
+despesa 1000 aluguel transporte 2026-03-19
+
+2) Com data automática
+despesa 120 mercado alimentacao hoje
+receita 500 freelance renda ontem
+
+3) Com categoria automática
+despesa 50 ifood auto hoje
+
+Regra:
+- palavra 1 = tipo
+- palavra 2 = valor
+- última = data|hoje|ontem
+- penúltima = categoria|auto
+- meio = descrição
+*/
 function interpretarTransacao(string $message): ?array
 {
     $partes = preg_split('/\s+/', trim($message));
@@ -241,10 +246,10 @@ function interpretarTransacao(string $message): ?array
         return null;
     }
 
-    $tipoBruto = normalizarTexto((string)$partes[0]);
+    $tipoBruto = strtolower(trim((string)$partes[0]));
     $valorBruto = str_replace(',', '.', trim((string)$partes[1]));
-    $dataRaw = normalizarTexto((string)$partes[count($partes) - 1]);
-    $categoriaRaw = normalizarTexto((string)$partes[count($partes) - 2]);
+    $dataRaw = strtolower(trim((string)$partes[count($partes) - 1]));
+    $categoriaRaw = strtolower(trim((string)$partes[count($partes) - 2]));
     $descricaoPartes = array_slice($partes, 2, -2);
     $descricao = trim(implode(' ', $descricaoPartes));
 
@@ -309,8 +314,7 @@ try {
         responderOk();
     }
 
-    $messageOriginal = trim((string)($update['message']['text'] ?? ''));
-    $messageNormalizada = normalizarTexto($messageOriginal);
+    $message = trim((string)($update['message']['text'] ?? ''));
     $chatId = $update['message']['chat']['id'] ?? null;
     $nomeTelegram = trim((string)($update['message']['chat']['first_name'] ?? 'Usuário'));
 
@@ -318,21 +322,21 @@ try {
         responderOk();
     }
 
-    if ($messageNormalizada === '/start' || $messageNormalizada === 'start') {
+    if ($message === '/start') {
         enviarMensagem(
             $chatId,
-            "Olá, {$nomeTelegram}.\n\nPara vincular sua conta:\n/vincular SEU_CODIGO\n\nComandos disponíveis:\nsaldo\nextrato\n\nExemplos:\nreceita 5000 salario renda 2026-03-19\ndespesa 100 mercado alimentacao hoje\ndespesa 50 ifood auto hoje",
+            "Olá, {$nomeTelegram}.\n\nPara vincular sua conta:\n/vincular SEU_CODIGO\n\nComandos disponíveis:\n/saldo\n/extrato\n\nExemplos:\nreceita 5000 salario renda 2026-03-19\ndespesa 100 mercado alimentacao hoje\ndespesa 50 ifood auto hoje",
             $TOKEN
         );
         responderOk();
     }
 
-    if (str_starts_with($messageNormalizada, '/vincular') || str_starts_with($messageNormalizada, 'vincular')) {
-        $partes = preg_split('/\s+/', $messageOriginal);
+    if (str_starts_with($message, '/vincular')) {
+        $partes = preg_split('/\s+/', $message);
         $codigo = trim((string)($partes[1] ?? ''));
 
         if ($codigo === '') {
-            enviarMensagem($chatId, "Use assim:\nvincular SEU_CODIGO", $TOKEN);
+            enviarMensagem($chatId, "Use assim:\n/vincular SEU_CODIGO", $TOKEN);
             responderOk();
         }
 
@@ -377,7 +381,7 @@ try {
     if (!$usuario) {
         enviarMensagem(
             $chatId,
-            "Sua conta ainda não está vinculada.\n\nEnvie:\nvincular SEU_CODIGO",
+            "Sua conta ainda não está vinculada.\n\nEnvie:\n/vincular SEU_CODIGO",
             $TOKEN
         );
         responderOk();
@@ -385,7 +389,7 @@ try {
 
     $usuarioId = (int)$usuario['id'];
 
-    if ($messageNormalizada === '/saldo' || $messageNormalizada === 'saldo') {
+    if ($message === '/saldo') {
         $resumo = buscarResumo($conn, $usuarioId);
 
         $texto = "💰 Saldo atual\n\n"
@@ -397,7 +401,7 @@ try {
         responderOk();
     }
 
-    if ($messageNormalizada === '/extrato' || $messageNormalizada === 'extrato') {
+    if ($message === '/extrato') {
         $extrato = buscarExtrato($conn, $usuarioId);
 
         if (empty($extrato)) {
@@ -422,7 +426,7 @@ try {
         responderOk();
     }
 
-    $transacao = interpretarTransacao($messageOriginal);
+    $transacao = interpretarTransacao($message);
 
     if ($transacao !== null) {
         salvarTransacao(
@@ -454,7 +458,7 @@ try {
 
     enviarMensagem(
         $chatId,
-        "Comando não reconhecido.\n\nUse:\nvincular SEU_CODIGO\nsaldo\nextrato\n\nExemplos:\nreceita 5000 salario renda 2026-03-19\ndespesa 120 mercado alimentacao hoje\ndespesa 50 ifood auto hoje",
+        "Comando não reconhecido.\n\nUse:\n/vincular SEU_CODIGO\n/saldo\n/extrato\n\nExemplos:\nreceita 5000 salario renda 2026-03-19\ndespesa 120 mercado alimentacao hoje\ndespesa 50 ifood auto hoje",
         $TOKEN
     );
 
