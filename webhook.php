@@ -107,19 +107,32 @@ function buscarUsuarioVinculado(PDO $conn, int|string $telegramId): ?array
     return $usuario ?: null;
 }
 
+/*
+ * Saldo real calculado pela soma das transações.
+ * Isso evita erro mesmo se alguma linha antiga tiver saldo_total inconsistente.
+ */
 function buscarSaldoAtual(PDO $conn, int $usuarioId): float
 {
     $stmt = $conn->prepare("
-        SELECT COALESCE(saldo_total, 0) AS saldo_total
+        SELECT
+            COALESCE(SUM(
+                CASE
+                    WHEN tipo = 'income' THEN valor
+                    WHEN tipo = 'expense' THEN -valor
+                    ELSE 0
+                END
+            ), 0) AS saldo
         FROM transacoes
         WHERE usuario_id = :usuario_id
-        ORDER BY data_transacao DESC, criado_em DESC, id DESC
-        LIMIT 1
     ");
-    $stmt->execute([':usuario_id' => $usuarioId]);
+
+    $stmt->execute([
+        ':usuario_id' => $usuarioId
+    ]);
+
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
-    return (float)($row['saldo_total'] ?? 0);
+    return (float)($row['saldo'] ?? 0);
 }
 
 function buscarResumo(PDO $conn, int $usuarioId): array
@@ -136,12 +149,11 @@ function buscarResumo(PDO $conn, int $usuarioId): array
 
     $receitas = (float)($row['receitas'] ?? 0);
     $despesas = (float)($row['despesas'] ?? 0);
-    $saldo = buscarSaldoAtual($conn, $usuarioId);
 
     return [
         'receitas' => $receitas,
         'despesas' => $despesas,
-        'saldo' => $saldo
+        'saldo' => $receitas - $despesas
     ];
 }
 
@@ -228,16 +240,19 @@ function detectarCategoria(string $descricao): string
         str_contains($descricao, 'ifood') ||
         str_contains($descricao, 'mercado') ||
         str_contains($descricao, 'restaurante') ||
-        str_contains($descricao, 'lanche')
+        str_contains($descricao, 'lanche') ||
+        str_contains($descricao, 'padaria')
     ) {
         return 'alimentacao';
     }
 
     if (
         str_contains($descricao, 'uber') ||
+        str_contains($descricao, '99') ||
         str_contains($descricao, 'gasolina') ||
         str_contains($descricao, 'combustivel') ||
-        str_contains($descricao, 'onibus')
+        str_contains($descricao, 'onibus') ||
+        str_contains($descricao, 'taxi')
     ) {
         return 'transporte';
     }
@@ -246,7 +261,8 @@ function detectarCategoria(string $descricao): string
         str_contains($descricao, 'aluguel') ||
         str_contains($descricao, 'condominio') ||
         str_contains($descricao, 'energia') ||
-        str_contains($descricao, 'agua')
+        str_contains($descricao, 'agua') ||
+        str_contains($descricao, 'internet')
     ) {
         return 'moradia';
     }
@@ -254,7 +270,8 @@ function detectarCategoria(string $descricao): string
     if (
         str_contains($descricao, 'academia') ||
         str_contains($descricao, 'farmacia') ||
-        str_contains($descricao, 'consulta')
+        str_contains($descricao, 'consulta') ||
+        str_contains($descricao, 'remedio')
     ) {
         return 'saude';
     }
@@ -263,7 +280,8 @@ function detectarCategoria(string $descricao): string
         str_contains($descricao, 'freelance') ||
         str_contains($descricao, 'salario') ||
         str_contains($descricao, 'pagamento') ||
-        str_contains($descricao, 'empresa')
+        str_contains($descricao, 'empresa') ||
+        str_contains($descricao, 'cliente')
     ) {
         return 'renda';
     }
@@ -271,6 +289,10 @@ function detectarCategoria(string $descricao): string
     return 'outros';
 }
 
+/*
+ * Continua preenchendo saldo_total na tabela,
+ * mas usando o saldo real calculado por SUM.
+ */
 function salvarTransacao(
     PDO $conn,
     int $usuarioId,
@@ -281,18 +303,23 @@ function salvarTransacao(
     string $data
 ): void {
     $stmtSaldo = $conn->prepare("
-        SELECT COALESCE(saldo_total, 0) AS saldo_total
+        SELECT
+            COALESCE(SUM(
+                CASE
+                    WHEN tipo = 'income' THEN valor
+                    WHEN tipo = 'expense' THEN -valor
+                    ELSE 0
+                END
+            ), 0) AS saldo
         FROM transacoes
         WHERE usuario_id = :usuario_id
-        ORDER BY data_transacao DESC, criado_em DESC, id DESC
-        LIMIT 1
     ");
     $stmtSaldo->execute([
         ':usuario_id' => $usuarioId
     ]);
 
-    $ultima = $stmtSaldo->fetch(PDO::FETCH_ASSOC);
-    $saldoAnterior = (float)($ultima['saldo_total'] ?? 0);
+    $row = $stmtSaldo->fetch(PDO::FETCH_ASSOC);
+    $saldoAnterior = (float)($row['saldo'] ?? 0);
 
     $novoSaldo = $tipo === 'income'
         ? $saldoAnterior + $valor
@@ -385,22 +412,29 @@ function interpretarTransacao(string $message): ?array
     ];
 }
 
+/*
+ * Frases mais humanas:
+ * gastei 50 no uber hoje
+ * paguei 120 de internet ontem
+ * comprei remedio por 30
+ * recebi 500 de freelance hoje
+ * ganhei 1200 com cliente ontem
+ */
 function interpretarNatural(string $message): ?array
 {
     $msg = normalizarTexto($message);
 
-    if (preg_match('/^gastei\s+(\d+(?:[.,]\d+)?)/', $msg, $m)) {
-        $valor = (float)str_replace(',', '.', $m[1]);
+    $data = date('Y-m-d');
+    if (str_contains($msg, ' ontem')) {
+        $data = date('Y-m-d', strtotime('-1 day'));
+    }
 
-        $data = date('Y-m-d');
-        if (str_contains($msg, ' ontem')) {
-            $data = date('Y-m-d', strtotime('-1 day'));
-        }
+    if (preg_match('/^(gastei|paguei|comprei|transferi)\s+(\d+(?:[.,]\d+)?)/', $msg, $m)) {
+        $valor = (float)str_replace(',', '.', $m[2]);
+        $descricao = 'gasto';
 
-        if (preg_match('/gastei\s+\d+(?:[.,]\d+)?\s+(?:no|na|com)\s+(.+?)(?:\s+hoje|\s+ontem|$)/', $msg, $descMatch)) {
+        if (preg_match('/(?:gastei|paguei|comprei|transferi)\s+\d+(?:[.,]\d+)?\s+(?:no|na|com|de|por)\s+(.+?)(?:\s+hoje|\s+ontem|$)/', $msg, $descMatch)) {
             $descricao = trim($descMatch[1]);
-        } else {
-            $descricao = 'gasto';
         }
 
         return [
@@ -412,18 +446,15 @@ function interpretarNatural(string $message): ?array
         ];
     }
 
-    if (preg_match('/^recebi\s+(\d+(?:[.,]\d+)?)/', $msg, $m)) {
-        $valor = (float)str_replace(',', '.', $m[1]);
+    if (preg_match('/^(recebi|ganhei|entrou|caiu|faturei)\s+(\d+(?:[.,]\d+)?)/', $msg, $m)) {
+        $valor = (float)str_replace(',', '.', $m[2]);
+        $descricao = 'renda';
 
-        $data = date('Y-m-d');
-        if (str_contains($msg, ' ontem')) {
-            $data = date('Y-m-d', strtotime('-1 day'));
-        }
-
-        if (preg_match('/recebi\s+\d+(?:[.,]\d+)?\s+(.+?)(?:\s+hoje|\s+ontem|$)/', $msg, $descMatch)) {
+        if (preg_match('/(?:recebi|ganhei|entrou|caiu|faturei)\s+\d+(?:[.,]\d+)?\s+(?:de|com|referente a|do|da)?\s*(.+?)(?:\s+hoje|\s+ontem|$)/', $msg, $descMatch)) {
             $descricao = trim($descMatch[1]);
-        } else {
-            $descricao = 'renda';
+            if ($descricao === '') {
+                $descricao = 'renda';
+            }
         }
 
         return [
@@ -474,6 +505,40 @@ function interpretarComandoExtrato(string $message): ?array
     return ['tipo' => 'erro'];
 }
 
+function interpretarPerguntaHumana(string $message): ?string
+{
+    $msg = normalizarTexto($message);
+
+    $perguntasSaldo = [
+        'quanto eu tenho',
+        'qual meu saldo',
+        'quanto tenho hoje',
+        'quanto eu tenho hoje',
+        'meu saldo'
+    ];
+
+    foreach ($perguntasSaldo as $p) {
+        if (str_contains($msg, $p)) {
+            return 'saldo';
+        }
+    }
+
+    $perguntasInsights = [
+        'onde gasto mais',
+        'qual meu maior gasto',
+        'com o que gasto mais',
+        'onde estou gastando mais'
+    ];
+
+    foreach ($perguntasInsights as $p) {
+        if (str_contains($msg, $p)) {
+            return 'insights';
+        }
+    }
+
+    return null;
+}
+
 try {
     $inputRaw = file_get_contents('php://input');
 
@@ -499,7 +564,7 @@ try {
     if ($messageNormalizada === '/start' || $messageNormalizada === 'start') {
         enviarMensagem(
             $chatId,
-            "Olá, {$nomeTelegram}.\n\nPara vincular sua conta:\nvincular SEU_CODIGO\n\nComandos disponíveis:\nsaldo\nextrato\nextrato 01/03/2026 31/03/2026\ninsights\n\nExemplos:\nreceita 5000 salario renda 19/03/2026\ndespesa 100 mercado alimentacao hoje\ndespesa 50 ifood auto ontem\ngastei 30 no uber hoje\nrecebi 500 freelance hoje",
+            "Olá, {$nomeTelegram}.\n\nPara vincular sua conta:\nvincular SEU_CODIGO\n\nComandos disponíveis:\nsaldo\nextrato\nextrato 01/03/2026 31/03/2026\ninsights\n\nExemplos:\nreceita 5000 salario renda 19/03/2026\ndespesa 100 mercado alimentacao hoje\ndespesa 50 ifood auto ontem\ngastei 30 no uber hoje\npaguei 120 de internet ontem\nrecebi 500 freelance hoje\nganhei 1200 com cliente ontem",
             $TOKEN
         );
         responderOk();
@@ -563,7 +628,9 @@ try {
 
     $usuarioId = (int)$usuario['id'];
 
-    if ($messageNormalizada === '/saldo' || $messageNormalizada === 'saldo') {
+    $perguntaHumana = interpretarPerguntaHumana($messageOriginal);
+
+    if ($messageNormalizada === '/saldo' || $messageNormalizada === 'saldo' || $perguntaHumana === 'saldo') {
         $resumo = buscarResumo($conn, $usuarioId);
 
         $texto = "💰 Saldo atual\n\n"
@@ -664,7 +731,7 @@ try {
         }
     }
 
-    if ($messageNormalizada === '/insights' || $messageNormalizada === 'insights') {
+    if ($messageNormalizada === '/insights' || $messageNormalizada === 'insights' || $perguntaHumana === 'insights') {
         $texto = gerarInsights($conn, $usuarioId);
         enviarMensagem($chatId, $texto, $TOKEN);
         responderOk();
@@ -706,7 +773,7 @@ try {
 
     enviarMensagem(
         $chatId,
-        "Comando não reconhecido.\n\nUse:\nvincular SEU_CODIGO\nsaldo\nextrato\nextrato 01/03/2026 31/03/2026\ninsights\n\nExemplos:\nreceita 5000 salario renda 19/03/2026\ndespesa 120 mercado alimentacao hoje\ndespesa 50 ifood auto ontem\ngastei 30 no uber hoje\nrecebi 500 freelance hoje",
+        "Comando não reconhecido.\n\nUse:\nvincular SEU_CODIGO\nsaldo\nextrato\nextrato 01/03/2026 31/03/2026\ninsights\n\nExemplos:\nreceita 5000 salario renda 19/03/2026\ndespesa 120 mercado alimentacao hoje\ndespesa 50 ifood auto ontem\ngastei 30 no uber hoje\npaguei 120 de internet ontem\nrecebi 500 freelance hoje\nganhei 1200 com cliente ontem\n\nPerguntas aceitas:\nquanto eu tenho hoje?\nonde gasto mais?",
         $TOKEN
     );
 
