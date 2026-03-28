@@ -3,7 +3,8 @@ declare(strict_types=1);
 
 require __DIR__ . '/db.php';
 
-$TOKEN = '8308783962:AAFpg2xrjevfet-q-6jt2kHNc7n_IFMstt8';
+$TOKEN = getenv('BOT_TOKEN') ?: '8308783962:AAFpg2xrjevfet-q-6jt2kHNc7n_IFMstt8';
+$OCR_API_KEY = getenv('OCR_API_KEY') ?: 'K85757705388957';
 
 function responderOk(): void
 {
@@ -25,13 +26,13 @@ function enviarMensagem(int|string $chatId, string $texto, string $token): void
     curl_setopt($ch, CURLOPT_POST, true);
     curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 15);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 20);
     curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
 
     $response = curl_exec($ch);
 
     if ($response === false) {
-        error_log('Erro cURL Telegram: ' . curl_error($ch));
+        error_log('Erro cURL Telegram sendMessage: ' . curl_error($ch));
     }
 
     curl_close($ch);
@@ -107,10 +108,6 @@ function buscarUsuarioVinculado(PDO $conn, int|string $telegramId): ?array
     return $usuario ?: null;
 }
 
-/*
- * Saldo real calculado pela soma das transações.
- * Isso evita erro mesmo se alguma linha antiga tiver saldo_total inconsistente.
- */
 function buscarSaldoAtual(PDO $conn, int $usuarioId): float
 {
     $stmt = $conn->prepare("
@@ -241,7 +238,8 @@ function detectarCategoria(string $descricao): string
         str_contains($descricao, 'mercado') ||
         str_contains($descricao, 'restaurante') ||
         str_contains($descricao, 'lanche') ||
-        str_contains($descricao, 'padaria')
+        str_contains($descricao, 'padaria') ||
+        str_contains($descricao, 'supermercado')
     ) {
         return 'alimentacao';
     }
@@ -252,7 +250,8 @@ function detectarCategoria(string $descricao): string
         str_contains($descricao, 'gasolina') ||
         str_contains($descricao, 'combustivel') ||
         str_contains($descricao, 'onibus') ||
-        str_contains($descricao, 'taxi')
+        str_contains($descricao, 'taxi') ||
+        str_contains($descricao, 'posto')
     ) {
         return 'transporte';
     }
@@ -289,10 +288,6 @@ function detectarCategoria(string $descricao): string
     return 'outros';
 }
 
-/*
- * Continua preenchendo saldo_total na tabela,
- * mas usando o saldo real calculado por SUM.
- */
 function salvarTransacao(
     PDO $conn,
     int $usuarioId,
@@ -412,14 +407,6 @@ function interpretarTransacao(string $message): ?array
     ];
 }
 
-/*
- * Frases mais humanas:
- * gastei 50 no uber hoje
- * paguei 120 de internet ontem
- * comprei remedio por 30
- * recebi 500 de freelance hoje
- * ganhei 1200 com cliente ontem
- */
 function interpretarNatural(string $message): ?array
 {
     $msg = normalizarTexto($message);
@@ -539,6 +526,293 @@ function interpretarPerguntaHumana(string $message): ?string
     return null;
 }
 
+/* ===================== OCR ===================== */
+
+function mensagemTemFoto(array $update): bool
+{
+    return isset($update['message']['photo']) && is_array($update['message']['photo']) && count($update['message']['photo']) > 0;
+}
+
+function obterMaiorFoto(array $photos): ?array
+{
+    if (empty($photos)) {
+        return null;
+    }
+
+    usort($photos, function ($a, $b) {
+        $aSize = $a['file_size'] ?? 0;
+        $bSize = $b['file_size'] ?? 0;
+        return $bSize <=> $aSize;
+    });
+
+    return $photos[0] ?? null;
+}
+
+function telegramGetFilePath(string $fileId, string $token): ?string
+{
+    $url = "https://api.telegram.org/bot{$token}/getFile?file_id=" . urlencode($fileId);
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 20);
+
+    $response = curl_exec($ch);
+
+    if ($response === false) {
+        error_log('Erro getFile Telegram: ' . curl_error($ch));
+        curl_close($ch);
+        return null;
+    }
+
+    curl_close($ch);
+
+    $json = json_decode($response, true);
+
+    if (!isset($json['ok']) || !$json['ok'] || empty($json['result']['file_path'])) {
+        return null;
+    }
+
+    return (string)$json['result']['file_path'];
+}
+
+function baixarArquivoTelegram(string $filePath, string $token): ?string
+{
+    $url = "https://api.telegram.org/file/bot{$token}/{$filePath}";
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+
+    $binario = curl_exec($ch);
+
+    if ($binario === false) {
+        error_log('Erro download Telegram: ' . curl_error($ch));
+        curl_close($ch);
+        return null;
+    }
+
+    curl_close($ch);
+
+    return $binario ?: null;
+}
+
+function executarOCR(string $imagemBinaria, string $ocrApiKey): ?string
+{
+    if ($ocrApiKey === '') {
+        error_log('OCR_API_KEY não configurada.');
+        return null;
+    }
+
+    $tmpFile = tempnam(sys_get_temp_dir(), 'ocr_');
+    if ($tmpFile === false) {
+        error_log('Falha ao criar arquivo temporário OCR.');
+        return null;
+    }
+
+    file_put_contents($tmpFile, $imagemBinaria);
+
+    $cfile = new CURLFile($tmpFile, 'image/jpeg', 'nota.jpg');
+
+    $payload = [
+        'apikey' => $ocrApiKey,
+        'language' => 'por',
+        'isOverlayRequired' => 'false',
+        'OCREngine' => '2',
+        'file' => $cfile
+    ];
+
+    $ch = curl_init('https://api.ocr.space/parse/image');
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 60);
+
+    $response = curl_exec($ch);
+
+    if ($response === false) {
+        error_log('Erro OCR.Space: ' . curl_error($ch));
+        curl_close($ch);
+        @unlink($tmpFile);
+        return null;
+    }
+
+    curl_close($ch);
+    @unlink($tmpFile);
+
+    $json = json_decode($response, true);
+
+    if (!$json) {
+        error_log('Resposta OCR.Space inválida.');
+        return null;
+    }
+
+    if (!empty($json['IsErroredOnProcessing'])) {
+        $erro = $json['ErrorMessage'] ?? 'Erro desconhecido no OCR.Space';
+        if (is_array($erro)) {
+            $erro = implode(' | ', $erro);
+        }
+        error_log('OCR.Space erro: ' . $erro);
+        return null;
+    }
+
+    if (
+        !isset($json['ParsedResults'][0]['ParsedText']) ||
+        !is_string($json['ParsedResults'][0]['ParsedText'])
+    ) {
+        return null;
+    }
+
+    $texto = trim($json['ParsedResults'][0]['ParsedText']);
+
+    return $texto !== '' ? $texto : null;
+}
+
+function extrairDadosNota(string $textoOCR): ?array
+{
+    $texto = trim($textoOCR);
+    if ($texto === '') {
+        return null;
+    }
+
+    $linhas = preg_split('/\r\n|\r|\n/', $texto);
+    $linhas = array_values(array_filter(array_map('trim', $linhas), fn($l) => $l !== ''));
+
+    if (empty($linhas)) {
+        return null;
+    }
+
+    $descricao = normalizarTexto($linhas[0]);
+
+    $data = date('Y-m-d');
+    if (preg_match('/\b(\d{2}\/\d{2}\/\d{4})\b/', $texto, $mData)) {
+        $dataConvertida = converterDataEntrada($mData[1]);
+        if ($dataConvertida !== null) {
+            $data = $dataConvertida;
+        }
+    }
+
+    $valor = null;
+
+    $padroesValor = [
+        '/(?:valor a pagar|total|vl total|valor total)\D{0,20}(\d+[.,]\d{2})/i',
+        '/(?:r\$)\s*(\d+[.,]\d{2})/i'
+    ];
+
+    foreach ($padroesValor as $padrao) {
+        if (preg_match_all($padrao, $texto, $matches) && !empty($matches[1])) {
+            $ultimo = end($matches[1]);
+            $valor = (float)str_replace(',', '.', str_replace('.', '', $ultimo));
+            break;
+        }
+    }
+
+    if ($valor === null) {
+        if (preg_match_all('/\b\d+[.,]\d{2}\b/', $texto, $todosValores) && !empty($todosValores[0])) {
+            $candidatos = [];
+            foreach ($todosValores[0] as $v) {
+                $candidatos[] = (float)str_replace(',', '.', str_replace('.', '', $v));
+            }
+            if (!empty($candidatos)) {
+                $valor = max($candidatos);
+            }
+        }
+    }
+
+    if ($valor === null || $valor <= 0) {
+        return null;
+    }
+
+    return [
+        'descricao' => $descricao,
+        'valor' => $valor,
+        'categoria' => detectarCategoria($descricao),
+        'data' => $data,
+        'texto_ocr' => $texto
+    ];
+}
+
+function criarPendenciaOCR(
+    PDO $conn,
+    int|string $telegramId,
+    int $usuarioId,
+    string $descricao,
+    float $valor,
+    string $categoria,
+    string $data,
+    string $textoOCR
+): int {
+    $stmt = $conn->prepare("
+        INSERT INTO ocr_pendencias (
+            telegram_id,
+            usuario_id,
+            descricao,
+            valor,
+            categoria,
+            data_transacao,
+            texto_ocr
+        ) VALUES (
+            :telegram_id,
+            :usuario_id,
+            :descricao,
+            :valor,
+            :categoria,
+            :data_transacao,
+            :texto_ocr
+        )
+        RETURNING id
+    ");
+
+    $stmt->execute([
+        ':telegram_id' => $telegramId,
+        ':usuario_id' => $usuarioId,
+        ':descricao' => $descricao,
+        ':valor' => $valor,
+        ':categoria' => $categoria,
+        ':data_transacao' => $data,
+        ':texto_ocr' => $textoOCR
+    ]);
+
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    return (int)$row['id'];
+}
+
+function buscarPendenciaOCR(PDO $conn, int $usuarioId, int $id): ?array
+{
+    $stmt = $conn->prepare("
+        SELECT *
+        FROM ocr_pendencias
+        WHERE id = :id
+          AND usuario_id = :usuario_id
+        LIMIT 1
+    ");
+    $stmt->execute([
+        ':id' => $id,
+        ':usuario_id' => $usuarioId
+    ]);
+
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    return $row ?: null;
+}
+
+function removerPendenciaOCR(PDO $conn, int $usuarioId, int $id): void
+{
+    $stmt = $conn->prepare("
+        DELETE FROM ocr_pendencias
+        WHERE id = :id
+          AND usuario_id = :usuario_id
+    ");
+    $stmt->execute([
+        ':id' => $id,
+        ':usuario_id' => $usuarioId
+    ]);
+}
+
+/* ===================== FIM OCR ===================== */
+
+$OCR_API_KEY = getenv('OCR_API_KEY') ?: '';
+
 try {
     $inputRaw = file_get_contents('php://input');
 
@@ -564,7 +838,7 @@ try {
     if ($messageNormalizada === '/start' || $messageNormalizada === 'start') {
         enviarMensagem(
             $chatId,
-            "Olá, {$nomeTelegram}.\n\nPara vincular sua conta:\nvincular SEU_CODIGO\n\nComandos disponíveis:\nsaldo\nextrato\nextrato 01/03/2026 31/03/2026\ninsights\n\nExemplos:\nreceita 5000 salario renda 19/03/2026\ndespesa 100 mercado alimentacao hoje\ndespesa 50 ifood auto ontem\ngastei 30 no uber hoje\npaguei 120 de internet ontem\nrecebi 500 freelance hoje\nganhei 1200 com cliente ontem",
+            "Olá, {$nomeTelegram}.\n\nPara vincular sua conta:\nvincular SEU_CODIGO\n\nComandos disponíveis:\nsaldo\nextrato\nextrato 01/03/2026 31/03/2026\ninsights\n\nOCR de nota:\nenvie uma foto da nota fiscal\n\nExemplos:\nreceita 5000 salario renda 19/03/2026\ndespesa 100 mercado alimentacao hoje\ndespesa 50 ifood auto ontem\ngastei 30 no uber hoje\npaguei 120 de internet ontem\nrecebi 500 freelance hoje\nganhei 1200 com cliente ontem",
             $TOKEN
         );
         responderOk();
@@ -627,6 +901,117 @@ try {
     }
 
     $usuarioId = (int)$usuario['id'];
+
+    if (preg_match('/^(confirmarocr|\/confirmarocr)\s+(\d+)$/i', $messageOriginal, $m)) {
+        $pendenciaId = (int)$m[2];
+        $pendencia = buscarPendenciaOCR($conn, $usuarioId, $pendenciaId);
+
+        if (!$pendencia) {
+            enviarMensagem($chatId, "Pendência OCR não encontrada.", $TOKEN);
+            responderOk();
+        }
+
+        salvarTransacao(
+            $conn,
+            $usuarioId,
+            (string)$pendencia['descricao'],
+            (float)$pendencia['valor'],
+            (string)$pendencia['categoria'],
+            'expense',
+            (string)$pendencia['data_transacao']
+        );
+
+        removerPendenciaOCR($conn, $usuarioId, $pendenciaId);
+
+        $saldoAtual = buscarSaldoAtual($conn, $usuarioId);
+
+        enviarMensagem(
+            $chatId,
+            "✅ Nota confirmada e registrada.\n\n"
+            . "Descrição: {$pendencia['descricao']}\n"
+            . "Valor: " . formatarReal((float)$pendencia['valor']) . "\n"
+            . "Categoria: {$pendencia['categoria']}\n"
+            . "Data: " . formatarDataBR((string)$pendencia['data_transacao']) . "\n\n"
+            . "Saldo total: " . formatarReal($saldoAtual),
+            $TOKEN
+        );
+        responderOk();
+    }
+
+    if (preg_match('/^(cancelarocr|\/cancelarocr)\s+(\d+)$/i', $messageOriginal, $m)) {
+        $pendenciaId = (int)$m[2];
+        removerPendenciaOCR($conn, $usuarioId, $pendenciaId);
+
+        enviarMensagem($chatId, "Pendência OCR cancelada.", $TOKEN);
+        responderOk();
+    }
+
+    if (mensagemTemFoto($update)) {
+        if ($OCR_API_KEY === '') {
+            enviarMensagem($chatId, "OCR não configurado. Defina OCR_API_KEY no servidor.", $TOKEN);
+            responderOk();
+        }
+
+        $maiorFoto = obterMaiorFoto($update['message']['photo']);
+        if (!$maiorFoto || empty($maiorFoto['file_id'])) {
+            enviarMensagem($chatId, "Não consegui processar a imagem enviada.", $TOKEN);
+            responderOk();
+        }
+
+        $filePath = telegramGetFilePath((string)$maiorFoto['file_id'], $TOKEN);
+        if ($filePath === null) {
+            enviarMensagem($chatId, "Não consegui baixar a imagem do Telegram.", $TOKEN);
+            responderOk();
+        }
+
+        $imagemBinaria = baixarArquivoTelegram($filePath, $TOKEN);
+        if ($imagemBinaria === null) {
+            enviarMensagem($chatId, "Falha ao baixar a imagem da nota.", $TOKEN);
+            responderOk();
+        }
+
+        $textoOCR = executarOCR($imagemBinaria, $OCR_API_KEY);
+        if ($textoOCR === null) {
+            enviarMensagem($chatId, "Não consegui ler a nota fiscal. Tente outra foto mais nítida.", $TOKEN);
+            responderOk();
+        }
+
+        $dadosNota = extrairDadosNota($textoOCR);
+        if ($dadosNota === null) {
+            enviarMensagem(
+                $chatId,
+                "Li a imagem, mas não consegui identificar os dados principais da nota.\n\nTente uma foto mais nítida ou registre manualmente.",
+                $TOKEN
+            );
+            responderOk();
+        }
+
+        $pendenciaId = criarPendenciaOCR(
+            $conn,
+            $chatId,
+            $usuarioId,
+            $dadosNota['descricao'],
+            $dadosNota['valor'],
+            $dadosNota['categoria'],
+            $dadosNota['data'],
+            $dadosNota['texto_ocr']
+        );
+
+        enviarMensagem(
+            $chatId,
+            "🧾 Nota identificada\n\n"
+            . "ID: {$pendenciaId}\n"
+            . "Descrição: {$dadosNota['descricao']}\n"
+            . "Valor: " . formatarReal($dadosNota['valor']) . "\n"
+            . "Categoria: {$dadosNota['categoria']}\n"
+            . "Data: " . formatarDataBR($dadosNota['data']) . "\n\n"
+            . "Para confirmar:\nconfirmarocr {$pendenciaId}\n\n"
+            . "Para cancelar:\ncancelarocr {$pendenciaId}",
+            $TOKEN
+        );
+
+        responderOk();
+    }
 
     $perguntaHumana = interpretarPerguntaHumana($messageOriginal);
 
@@ -773,7 +1158,7 @@ try {
 
     enviarMensagem(
         $chatId,
-        "Comando não reconhecido.\n\nUse:\nvincular SEU_CODIGO\nsaldo\nextrato\nextrato 01/03/2026 31/03/2026\ninsights\n\nExemplos:\nreceita 5000 salario renda 19/03/2026\ndespesa 120 mercado alimentacao hoje\ndespesa 50 ifood auto ontem\ngastei 30 no uber hoje\npaguei 120 de internet ontem\nrecebi 500 freelance hoje\nganhei 1200 com cliente ontem\n\nPerguntas aceitas:\nquanto eu tenho hoje?\nonde gasto mais?",
+        "Comando não reconhecido.\n\nUse:\nvincular SEU_CODIGO\nsaldo\nextrato\nextrato 01/03/2026 31/03/2026\ninsights\n\nOCR de nota:\nenvie uma foto da nota fiscal\n\nExemplos:\nreceita 5000 salario renda 19/03/2026\ndespesa 120 mercado alimentacao hoje\ndespesa 50 ifood auto ontem\ngastei 30 no uber hoje\npaguei 120 de internet ontem\nrecebi 500 freelance hoje\nganhei 1200 com cliente ontem\n\nPerguntas aceitas:\nquanto eu tenho hoje?\nonde gasto mais?",
         $TOKEN
     );
 
